@@ -70,6 +70,8 @@ hr.sep { border: 0; border-top: 1px solid var(--ui-line); margin: 4px 0; width: 
 .tools select { width: auto; padding: 5px 8px; font-size: 12px; border-radius: 8px; flex: 1 1 150px; min-width: 0; }
 .tools button { border: 1px solid var(--ui-line); background: var(--ui-raise); border-radius: 8px; padding: 5px 9px; font-size: 12px; color: var(--ui-muted); }
 .tools button:hover:not(:disabled) { color: var(--ui-text); border-color: #4a4138; }
+.tools .btn-file { border: 1px solid var(--ui-line); background: var(--ui-raise); border-radius: 8px; padding: 5px 9px; font-size: 12px; color: var(--ui-gold); cursor: pointer; }
+.tools .btn-file:hover { border-color: var(--ui-gold); }
 .tools .n { font-size: 12px; color: var(--ui-muted); font-variant-numeric: tabular-nums; width: 20px; }
 
 @media (max-width: 820px) {
@@ -120,6 +122,20 @@ hr.sep { border: 0; border-top: 1px solid var(--ui-line); margin: 4px 0; width: 
 .cover .zone { top: 560px; bottom: 160px; justify-content: flex-end; }
 .cover.noart .zone { top: 200px; justify-content: center; }
 .artlay .zone { top: 760px; bottom: 160px; justify-content: flex-start; }
+/* фото */
+.ph { position: absolute; inset: 0; width: 1080px; height: 1350px; object-fit: cover; display: block; }
+.haze { position: absolute; inset: 0; background: radial-gradient(38% 50% at 96% 46%, rgba(255,255,255,.72) 0%, rgba(255,255,255,.3) 45%, rgba(255,255,255,0) 100%), radial-gradient(60% 40% at 100% 72%, rgba(255,255,255,.22) 0%, rgba(255,255,255,0) 100%); }
+.shade { position: absolute; inset: 0; background: linear-gradient(180deg, rgba(14,10,8,0) 38%, rgba(14,10,8,.42) 66%, rgba(14,10,8,.78) 100%); }
+.photo .h, .photo .lead { color: #fff; }
+.photo .p { color: rgba(255,255,255,.86); }
+.photo .p .hl { color: #fff; }
+.photo .zone { top: 560px; bottom: 160px; justify-content: flex-end; }
+.photo.cover .zone { top: 560px; }
+.photo .foot, .photo .counter { color: rgba(255,255,255,.7); }
+.artph { position: absolute; border-radius: 26px; overflow: hidden; }
+.artph img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.frame.drop { outline: 3px dashed var(--ui-gold); outline-offset: 3px; }
+.tools input[type=range] { flex: 1 1 100%; accent-color: var(--ui-gold); }
 </style>
 
 <div class="app">
@@ -180,7 +196,8 @@ const LAYOUTS = {
   quote: "Цитата с линией",
   list: "Список",
   number: "Крупная цифра",
-  art: "Графика + текст",
+  art: "Графика / фото + текст",
+  photo: "Фото на весь слайд",
   cta: "Призыв (финал)",
 };
 
@@ -296,16 +313,26 @@ function slideHTML(s, i, n) {
   let inner = "", extra = "", cls = "";
   switch (s.layout) {
     case "cover":
-      cls = s.art ? "cover" : "cover noart";
-      extra = s.art ? artBlock(s, [140, 110, 800, 520], pal) : "";
+      if (s.photo) { cls = "cover photo"; extra = photoBg(s); }
+      else { cls = s.art ? "cover" : "cover noart"; extra = s.art ? artBlock(s, [140, 110, 800, 520], pal) : ""; }
       inner = h + p;
+      break;
+    case "photo":
+      cls = "photo"; extra = s.photo ? photoBg(s) : `<div class="art-wait" style="left:140px;top:160px;width:800px;height:560px">перетащите фото</div>`;
+      inner = lead + h + p;
       break;
     case "text": inner = lead + h + rule + p; break;
     case "box": inner = lead + h + p + box; break;
     case "quote": inner = `<div class="quote">${(s.items || []).map((t) => `<p>${rich(t)}</p>`).join("")}</div>` + h + box; break;
     case "list": inner = h + `<div class="list">${(s.items || []).map((t, k) => `<div class="li"><em>${String(k + 1).padStart(2, "0")}</em><span>${rich(t)}</span></div>`).join("")}</div>` + p; break;
     case "number": inner = `<p class="big">${rich(s.big || "")}</p>` + h + p; break;
-    case "art": cls = "artlay"; extra = artBlock(s, [200, 150, 680, 560], pal); inner = h + p; break;
+    case "art":
+      cls = "artlay";
+      extra = s.photo
+        ? `<div class="artph" style="left:140px;top:150px;width:800px;height:560px"><img src="${s.photo}" alt="" style="width:800px;height:560px;object-position:50% ${s.focus ?? 40}%"></div>`
+        : artBlock(s, [200, 150, 680, 560], pal);
+      inner = h + p;
+      break;
     case "cta": inner = h + rule + p; break;
     default: inner = lead + h + p;
   }
@@ -313,9 +340,13 @@ function slideHTML(s, i, n) {
   return `<div class="slide ${cls}" style="${vars}" data-i="${i}">
     <div class="bg"></div>${extra}
     <div class="zone"><div class="stack">${inner}</div></div>
-    ${s.layout !== "cover" ? `<div class="counter">${String(i + 1).padStart(2, "0")} / ${String(n).padStart(2, "0")}</div>` : ""}
+    ${s.layout !== "cover" && !(s.layout === "photo" && i === 0) ? `<div class="counter">${String(i + 1).padStart(2, "0")} / ${String(n).padStart(2, "0")}</div>` : ""}
     <div class="foot ${last ? "c" : ""}"><span class="handle">${esc(state.handle)}</span>${last ? "" : ARROW}</div>
   </div>`;
+}
+
+function photoBg(s) {
+  return `<img class="ph" src="${s.photo}" alt="" style="width:1080px;height:1350px;object-position:50% ${s.focus ?? 40}%">${state.haze === false ? "" : '<div class="haze"></div>'}<div class="shade"></div>`;
 }
 
 // Подгонка: уменьшаем кегль, пока текст не влезет в свою зону
@@ -349,9 +380,11 @@ function render() {
         <span class="n">${i + 1}</span>
         <select aria-label="Макет слайда ${i + 1}" data-act="layout">${Object.entries(LAYOUTS).map(([k, v]) => `<option value="${k}" ${k === s.layout ? "selected" : ""}>${v}</option>`).join("")}</select>
         <button data-act="tone" title="Светлый / тёмный фон">${s.tone === "light" ? "☀" : "☾"}</button>
-        <button data-act="art" ${aiReady ? "" : "disabled"} title="Графика по смыслу">${s.art ? "перерисовать" : "+ графика"}</button>
-        ${s.art ? `<button data-act="noart" title="Убрать графику">✕</button>` : ""}
+        <label class="btn-file" title="Своё фото (можно просто перетащить на слайд)"><input type="file" accept="image/*" data-act="photo" hidden>${s.photo ? "другое фото" : "+ фото"}</label>
+        ${s.photo ? `<button data-act="nophoto" title="Убрать фото">✕ фото</button>` : `<button data-act="art" ${aiReady ? "" : "disabled"} title="Графика по смыслу">${s.art ? "перерисовать" : "+ графика"}</button>`}
+        ${s.art && !s.photo ? `<button data-act="noart" title="Убрать графику">✕</button>` : ""}
         <button data-act="png" title="Скачать PNG">PNG</button>
+        ${s.photo ? `<input type="range" min="0" max="100" value="${s.focus ?? 40}" data-act="focus" aria-label="Кадр фото по вертикали" title="Сдвиг кадра">` : ""}
       </div>
     </div>`).join("");
   gallery.querySelectorAll(".slide").forEach(fit);
@@ -359,14 +392,64 @@ function render() {
   save();
 }
 
+// ---------- Свои фото ----------
+// Уменьшаем до 1350px по длинной стороне: так файл лёгкий, а качество для 1080×1350 то же
+function readPhoto(file) {
+  return new Promise((resolve, reject) => {
+    if (!file || !file.type.startsWith("image/")) return reject();
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const k = Math.min(1, 1600 / Math.max(img.width, img.height));
+      const c = document.createElement("canvas");
+      c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      resolve(c.toDataURL("image/jpeg", 0.9));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(); };
+    img.src = url;
+  });
+}
+async function setPhoto(s, file) {
+  try {
+    s.photo = await readPhoto(file);
+    if (!["cover", "art", "photo"].includes(s.layout)) s.layout = "photo";
+    if (s.layout === "photo" || s.layout === "cover") s.tone = "dark";
+    render();
+    setStatus("Фото добавлено. Кадр можно сдвинуть ползунком под слайдом.");
+  } catch { setStatus("Не удалось открыть этот файл как картинку.", "err"); }
+}
+gallery.addEventListener("dragover", (e) => { const f = e.target.closest(".frame"); if (!f) return; e.preventDefault(); f.classList.add("drop"); });
+gallery.addEventListener("dragleave", (e) => e.target.closest(".frame")?.classList.remove("drop"));
+gallery.addEventListener("drop", (e) => {
+  const f = e.target.closest(".frame"); if (!f) return;
+  e.preventDefault(); f.classList.remove("drop");
+  const s = state.slides.find((x) => x.id === f.closest(".card").dataset.id);
+  if (e.dataTransfer.files[0]) setPhoto(s, e.dataTransfer.files[0]);
+});
+gallery.addEventListener("input", (e) => {
+  if (e.target.dataset.act !== "focus") return;
+  const card = e.target.closest(".card");
+  const s = state.slides.find((x) => x.id === card.dataset.id);
+  s.focus = Number(e.target.value);
+  card.querySelectorAll(".ph, .artph img").forEach((img) => (img.style.objectPosition = `50% ${s.focus}%`));
+  save();
+});
+
 gallery.addEventListener("change", (e) => {
   const card = e.target.closest(".card");
+  if (card && e.target.dataset.act === "photo") {
+    const s = state.slides.find((x) => x.id === card.dataset.id);
+    if (e.target.files[0]) setPhoto(s, e.target.files[0]);
+    return;
+  }
   if (!card || e.target.dataset.act !== "layout") return;
   const s = state.slides.find((x) => x.id === card.dataset.id);
   s.layout = e.target.value;
-  if (s.layout === "art" && !s.art) s.art = { idea: plain(s.title) };
+  if (s.layout === "art" && !s.art && !s.photo) s.art = { idea: plain(s.title) };
   render();
-  if (s.layout === "art" && !s.art.svg) drawArt(s);
+  if (s.layout === "art" && !s.photo && s.art && !s.art.svg && aiReady) drawArt(s);
 });
 gallery.addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-act]");
@@ -375,6 +458,7 @@ gallery.addEventListener("click", (e) => {
   const act = btn.dataset.act;
   if (act === "tone") { s.tone = s.tone === "light" ? "dark" : "light"; render(); }
   if (act === "art") { s.art = { idea: s.art?.idea || plain(s.title || s.big) }; drawArt(s, true); }
+  if (act === "nophoto") { s.photo = null; if (s.layout === "photo") s.layout = "statement"; render(); }
   if (act === "noart") { s.art = null; if (s.layout === "art") s.layout = "statement"; render(); }
   if (act === "png") exportOne(s);
 });
@@ -412,7 +496,8 @@ const LAYOUT_GUIDE = `Макеты (поле layout):
 - quote — items (2–4 короткие фразы-примера, идут с вертикальной линией), затем big (вывод на плашке) и note (мелко под ним); title не обязателен.
 - list — title + items (3–5 пунктов списка).
 - number — big (цифра или короткое число/слово, до 6 символов: «2», «80%», «7:00»), title, body.
-- art — графика сверху, ниже title + body. Для мысли, которую усиливает образ.
+- art — графика (или фото автора) сверху, ниже title + body. Для мысли, которую усиливает образ.
+- photo — фото автора на весь слайд, текст снизу белым: lead, title, body. Только для слайдов, где у автора есть фото (hasPhoto).
 - cta — финальный призыв: title + линия + body. Последний слайд, если в тексте есть призыв.`;
 
 function layoutPrompt(text) {
@@ -452,8 +537,9 @@ function artPrompt(idea, context) {
 }
 
 function editPrompt(instruction) {
-  const current = state.slides.map(({ layout, tone, lead, title, body, items, note, big, art }) => ({ layout, tone, lead, title, body, items, note, big, art: art ? { idea: art.idea } : null }));
+  const current = state.slides.map(({ layout, tone, lead, title, body, items, note, big, art, photo }) => ({ layout, tone, lead, title, body, items, note, big, art: art ? { idea: art.idea } : null, hasPhoto: !!photo }));
   return `Ты редактируешь Instagram-карусель. Вот текущие слайды (JSON) и просьба автора. Внеси ровно то, что просят, остальное оставь как есть. Слова автора не переписывай, если об этом не просят.
+Поле hasPhoto — у слайда есть фото автора: сохраняй его у того же по смыслу слайда (верни "hasPhoto": true), фото не заменяется графикой.
 Если нужна новая или другая графика на слайде — укажи art.idea и добавь "redraw": true внутрь art. Если графику не трогали — оставь art как был.
 
 ${LAYOUT_GUIDE}
@@ -522,7 +608,9 @@ goBtn.addEventListener("click", async () => {
   setStatus("Claude раскладывает текст по слайдам…", "busy");
   try {
     const data = await sample.json(layoutPrompt(text.slice(0, 20000)));
-    state.slides = normalize(data.slides);
+    // фото автора остаются на слайдах с теми же номерами
+    const photos = state.slides.map((x) => x.photo && { photo: x.photo, focus: x.focus });
+    state.slides = normalize(data.slides).map((x, i) => (photos[i] ? { ...x, ...photos[i], layout: ["cover", "art", "photo"].includes(x.layout) ? x.layout : i === 0 ? "cover" : "photo", art: null } : x));
     render();
     const withArt = state.slides.filter((s) => s.art);
     setStatus(withArt.length ? `Слайды готовы. Рисую графику: ${withArt.length}…` : "Готово.", withArt.length ? "busy" : "");
@@ -549,6 +637,13 @@ applyBtn.addEventListener("click", async () => {
       const prevArt = old.find((o) => o.art?.svg && o.art.idea === s.art.idea)?.art || (old[i]?.art?.svg && !s.art.redraw && old[i].art.idea === s.art.idea ? old[i].art : null);
       if (prevArt && !s.art.redraw) s.art = { idea: s.art.idea, svg: prevArt.svg };
     });
+    // фото переносим на слайды, где Claude оставил hasPhoto (по порядку)
+    const photos = old.filter((x) => x.photo).map((x) => ({ photo: x.photo, focus: x.focus }));
+    data.slides.forEach((raw, i) => { if (raw.hasPhoto && photos.length) { Object.assign(next[i], photos.shift()); next[i].art = null; } });
+    // страховка: если Claude потерял отметки, фото остаются на слайдах с теми же номерами
+    if (photos.length === old.filter((x) => x.photo).length) {
+      old.forEach((o, i) => { if (o.photo && next[i]) { next[i].photo = o.photo; next[i].focus = o.focus; next[i].art = null; if (!["cover", "art", "photo"].includes(next[i].layout)) next[i].layout = i === 0 ? "cover" : "photo"; } });
+    }
     state.slides = next;
     editEl.value = "";
     render();
