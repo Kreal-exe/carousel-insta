@@ -10,7 +10,7 @@ const API = "https://api.openai.com/v1";
 
 // Правила собраны из актуальных гайдов по каруселям (2025–2026):
 // хук на первом слайде, одна мысль на слайд, открытая петля, CTA в конце.
-const SYSTEM_PROMPT = `Ты — сильный SMM-копирайтер и контент-стратег, который пишет вирусные Instagram-карусели.
+export const SYSTEM_PROMPT = `Ты — сильный SMM-копирайтер и контент-стратег, который пишет вирусные Instagram-карусели.
 
 Правила, которые ты соблюдаешь всегда:
 1. Слайд 1 (kind="cover") — ХУК. Заголовок до 8 слов: смелое утверждение, контринтуитивная мысль, конкретный результат или цифра. Он должен остановить скролл и заставить свайпнуть. body — одна короткая строка-подводка (до 12 слов) или пусто.
@@ -77,10 +77,10 @@ async function call<T>(path: string, apiKey: string, body: unknown): Promise<T> 
   return data as T;
 }
 
-export async function generateCarousel(brief: Brief, apiKey: string, model: string): Promise<GeneratedCarousel> {
-  if (!brief.topic.trim()) throw new Error("Укажите тему карусели");
+/** Описание задачи из брифа — общее для API и режима «через ChatGPT» */
+export function briefPrompt(brief: Brief): string {
   const count = Math.min(Math.max(Number(brief.slideCount) || 8, 3), 20);
-  const userPrompt = [
+  return [
     `Тема: ${brief.topic}`,
     brief.audience && `Целевая аудитория: ${brief.audience}`,
     `Цель поста: ${brief.goal}`,
@@ -92,36 +92,10 @@ export async function generateCarousel(brief: Brief, apiKey: string, model: stri
   ]
     .filter(Boolean)
     .join("\n");
-
-  const completion = await call<ChatResponse>(
-    "/chat/completions",
-    apiKey,
-    {
-      model: model || "gpt-5.5",
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: userPrompt },
-      ],
-      response_format: { type: "json_schema", json_schema: { name: "carousel", strict: true, schema: SCHEMA } },
-    },
-  );
-  const content = completion.choices?.[0]?.message?.content;
-  if (!content) throw new Error("Модель вернула пустой ответ");
-  const data = JSON.parse(content) as GeneratedCarousel;
-  data.hashtags = data.hashtags.map((h) => h.replace(/^#/, "").replace(/\s+/g, ""));
-  return data;
 }
 
-type ChatResponse = { choices: Array<{ message: { content: string | null } }> };
-
-/** 5 альтернативных заголовков для слайда (для обложки — варианты хука) */
-export async function generateTitleVariants(
-  slide: Slide,
-  slides: Slide[],
-  brief: Brief,
-  apiKey: string,
-  model: string,
-): Promise<string[]> {
+/** Задание «5 вариантов заголовка» для слайда (для обложки — варианты хука) */
+export function titleVariantsTask(slide: Slide, slides: Slide[], brief: Brief): string {
   const context = slides.map((s, i) => `${i + 1}. [${s.kind}] ${s.title.replace(/\*\*/g, "")}`).join("\n");
   const task =
     slide.kind === "cover"
@@ -129,14 +103,40 @@ export async function generateTitleVariants(
       : slide.kind === "cta"
         ? "Придумай 5 вариантов заголовка для финального слайда с призывом (сохранить / поделиться / написать в директ). До 7 слов."
         : "Придумай 5 альтернативных заголовков для этого слайда: короче, точнее, цепляюще. До 7 слов.";
+  return `Тема карусели: ${brief.topic}\nТон: ${brief.tone}\nЯзык: ${brief.language || "русский"}\nВсе слайды:\n${context}\n\nТекущий слайд: «${slide.title}» — ${slide.body}\n\n${task} Выдели 1–2 ключевых слова **звёздочками**.`;
+}
+
+type ChatResponse = { choices: Array<{ message: { content: string | null } }> };
+
+export async function generateCarousel(brief: Brief, apiKey: string, model: string): Promise<GeneratedCarousel> {
+  if (!brief.topic.trim()) throw new Error("Укажите тему карусели");
+  const completion = await call<ChatResponse>("/chat/completions", apiKey, {
+    model: model || "gpt-5.5",
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: briefPrompt(brief) },
+    ],
+    response_format: { type: "json_schema", json_schema: { name: "carousel", strict: true, schema: SCHEMA } },
+  });
+  const content = completion.choices?.[0]?.message?.content;
+  if (!content) throw new Error("Модель вернула пустой ответ");
+  const data = JSON.parse(content) as GeneratedCarousel;
+  data.hashtags = data.hashtags.map((h) => h.replace(/^#/, "").replace(/\s+/g, ""));
+  return data;
+}
+
+export async function generateTitleVariants(
+  slide: Slide,
+  slides: Slide[],
+  brief: Brief,
+  apiKey: string,
+  model: string,
+): Promise<string[]> {
   const res = await call<ChatResponse>("/chat/completions", apiKey, {
     model: model || "gpt-5.5",
     messages: [
       { role: "system", content: SYSTEM_PROMPT },
-      {
-        role: "user",
-        content: `Тема карусели: ${brief.topic}\nТон: ${brief.tone}\nЯзык: ${brief.language || "русский"}\nВсе слайды:\n${context}\n\nТекущий слайд: «${slide.title}» — ${slide.body}\n\n${task} Выдели 1–2 ключевых слова **звёздочками**.`,
-      },
+      { role: "user", content: titleVariantsTask(slide, slides, brief) },
     ],
     response_format: {
       type: "json_schema",

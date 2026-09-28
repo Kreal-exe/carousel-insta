@@ -230,6 +230,7 @@ export const THEMES: Array<{ id: string; label: string; design: Partial<Design> 
 ];
 
 export const DEFAULT_SETTINGS: Settings = {
+  mode: "chatgpt",
   apiKey: "",
   textModel: "gpt-5.5",
   imageModel: "gpt-image-2",

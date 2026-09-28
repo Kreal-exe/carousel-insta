@@ -65,6 +65,8 @@ export interface Brief {
 }
 
 export interface Settings {
+  /** chatgpt — без ключа, через обычный ChatGPT; api — автоматически через API-ключ */
+  mode: "chatgpt" | "api";
   apiKey: string;
   textModel: string;
   imageModel: string;

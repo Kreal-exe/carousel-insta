@@ -21,8 +21,16 @@ import {
 } from "@/lib/presets";
 import { buildImagePrompt } from "@/lib/imagePrompt";
 import { generateCarousel, generateImage as requestImage, generateTitleVariants } from "@/lib/openai";
+import {
+  carouselTaskPrompt,
+  imagesTaskPrompt,
+  openInChatGPT,
+  parseCarouselAnswer,
+  sortImageFiles,
+  titleVariantsPrompt,
+} from "@/lib/chatgpt";
 import { loadProject, loadSettings, saveProject, saveSettings } from "@/lib/storage";
-import type { Brief, Design, LayoutId, Project, Settings, Slide, SlideKind } from "@/lib/types";
+import type { Brief, Design, GeneratedCarousel, LayoutId, Project, Settings, Slide, SlideKind } from "@/lib/types";
 import { SLIDE_H, SLIDE_W } from "@/lib/types";
 import { ScaledSlide, SlideView, resolveLayout } from "./SlideView";
 import { InstagramPreview } from "./InstagramPreview";
@@ -57,6 +65,8 @@ export default function App() {
   const [busyText, setBusyText] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [autoImages, setAutoImages] = useState(true);
+  const [chatAnswer, setChatAnswer] = useState("");
+  const [dragOver, setDragOver] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showPreview, setShowPreview] = useState(false);
   const [variants, setVariants] = useState<{ slideId: string; titles: string[]; loading: boolean } | null>(null);
@@ -67,7 +77,9 @@ export default function App() {
 
   // --- загрузка / сохранение ---
   useEffect(() => {
-    setSettings({ ...DEFAULT_SETTINGS, ...loadSettings() });
+    const stored = loadSettings();
+    // у тех, кто уже ввёл ключ до появления режимов, оставляем автоматический режим
+    setSettings({ ...DEFAULT_SETTINGS, mode: stored.apiKey ? "api" : "chatgpt", ...stored });
     loadProject().then((p) => {
       if (p) {
         // незавершённые генерации после перезагрузки сбрасываем
@@ -148,18 +160,14 @@ export default function App() {
     }
     if (!settings.apiKey.trim()) {
       setShowSettings(true);
-      setToast({ kind: "error", text: "Вставьте API-ключ OpenAI, чтобы генерировать карусели" });
+      setToast({ kind: "error", text: "Вставьте API-ключ OpenAI или переключитесь на режим «Через ChatGPT»" });
       return;
     }
     setBusyText(true);
     try {
       const data = await generateCarousel(project.brief, settings.apiKey, settings.textModel);
-      const slides: Slide[] = data.slides.map((s) => ({ ...s, id: uid(), imageStatus: "idle" }));
-      const next = { ...projectRef.current, slides, caption: data.caption, hashtags: data.hashtags };
-      projectRef.current = next;
-      setProject(next);
-      setSelectedId(slides[0]?.id ?? null);
-      if (autoImages) generateImages(slides.filter((s) => needsImage(s, next.design)).map((s) => s.id));
+      const slides = applyCarousel(data);
+      if (autoImages) generateImages(slides.filter((s) => needsImage(s, projectRef.current.design)).map((s) => s.id));
     } catch (e) {
       setToast({ kind: "error", text: e instanceof Error ? e.message : String(e) });
     } finally {
@@ -167,7 +175,83 @@ export default function App() {
     }
   }
 
+  function applyCarousel(data: GeneratedCarousel): Slide[] {
+    const slides: Slide[] = data.slides.map((s) => ({ ...s, id: uid(), imageStatus: "idle" }));
+    const next = { ...projectRef.current, slides, caption: data.caption, hashtags: data.hashtags };
+    projectRef.current = next;
+    setProject(next);
+    setSelectedId(slides[0]?.id ?? null);
+    return slides;
+  }
+
+  // --- режим «через ChatGPT» ---
+  async function openChat(prompt: string, what: string) {
+    const how = await openInChatGPT(prompt);
+    setToast({
+      kind: "info",
+      text:
+        how === "prefilled"
+          ? `${what}: ChatGPT открыт в новой вкладке. Задание также в буфере обмена — если поле пустое, вставьте его (Ctrl+V).`
+          : `${what}: задание скопировано — вставьте его в ChatGPT (Ctrl+V) и отправьте.`,
+    });
+  }
+
+  function startChatGPT() {
+    if (!project.brief.topic.trim()) {
+      setToast({ kind: "error", text: "Сначала напишите тему карусели" });
+      return;
+    }
+    openChat(carouselTaskPrompt(project.brief), "Тексты");
+  }
+
+  function importChatAnswer() {
+    try {
+      const slides = applyCarousel(parseCarouselAnswer(chatAnswer));
+      setChatAnswer("");
+      setToast({ kind: "info", text: `Готово: ${slides.length} слайдов. Теперь — картинки (кнопка над слайдами).` });
+    } catch (e) {
+      setToast({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  /** Слайды, которым нужны картинки: сначала пустые, а если все заполнены — все по порядку */
+  function imageTargets(): Slide[] {
+    const { slides: all, design: d } = projectRef.current;
+    const withImages = all.filter((s) => needsImage(s, d));
+    const empty = withImages.filter((s) => !s.image);
+    return empty.length ? empty : withImages;
+  }
+
+  function openImagesInChatGPT() {
+    const { design: d } = projectRef.current;
+    const targets = imageTargets();
+    if (!targets.length) {
+      setToast({ kind: "info", text: "В текущих макетах картинки не нужны — выберите макет с фото во вкладке «Дизайн»." });
+      return;
+    }
+    openChat(imagesTaskPrompt(targets.map((s) => fullPrompt(s, d))), `Картинки (${targets.length})`);
+  }
+
+  function bulkUpload(files: File[]) {
+    const images = sortImageFiles(files.filter((f) => f.type.startsWith("image/")));
+    const targets = imageTargets();
+    images.slice(0, targets.length).forEach((f, i) => uploadImage(targets[i].id, f));
+    const placed = Math.min(images.length, targets.length);
+    setToast({
+      kind: "info",
+      text:
+        `Картинок разложено по слайдам: ${placed}.` +
+        (images.length > targets.length ? ` Лишних: ${images.length - targets.length}.` : "") +
+        " Чтобы поменять картинку на слайде — перетащите файл прямо на него.",
+    });
+  }
+
   async function suggestTitles(slide: Slide) {
+    if (settings.mode === "chatgpt") {
+      const { slides: all, brief: b } = projectRef.current;
+      openChat(titleVariantsPrompt(slide, all, b), "Варианты заголовка");
+      return;
+    }
     if (!settings.apiKey.trim()) {
       setShowSettings(true);
       return;
@@ -412,13 +496,54 @@ export default function App() {
                   onChange={(e) => setBrief({ extra: e.target.value })}
                 />
               </label>
-              <label className="check">
-                <input type="checkbox" checked={autoImages} onChange={(e) => setAutoImages(e.target.checked)} />
-                Сразу сгенерировать изображения
-              </label>
-              <button className="btn btn--primary btn--wide" disabled={busyText} onClick={generateText}>
-                {busyText ? "Пишу тексты…" : slides.length ? "Перегенерировать карусель" : "Сгенерировать карусель"}
-              </button>
+              <div className="field-title">Как генерировать</div>
+              <div className="seg">
+                <button
+                  className={settings.mode === "chatgpt" ? "active" : ""}
+                  onClick={() => updateSettings({ mode: "chatgpt" })}
+                >
+                  Через ChatGPT
+                  <small>по подписке, без ключа</small>
+                </button>
+                <button className={settings.mode === "api" ? "active" : ""} onClick={() => updateSettings({ mode: "api" })}>
+                  Автоматически
+                  <small>API-ключ OpenAI</small>
+                </button>
+              </div>
+
+              {settings.mode === "chatgpt" ? (
+                <>
+                  <button className="btn btn--primary btn--wide" onClick={startChatGPT}>
+                    ① Открыть задание в ChatGPT
+                  </button>
+                  <label>
+                    ② Вставьте сюда ответ ChatGPT
+                    <textarea
+                      rows={4}
+                      placeholder="Скопируйте ответ целиком (кнопка «Копировать» под сообщением ChatGPT) и вставьте"
+                      value={chatAnswer}
+                      onChange={(e) => setChatAnswer(e.target.value)}
+                    />
+                  </label>
+                  <button className="btn btn--wide" disabled={!chatAnswer.trim()} onClick={importChatAnswer}>
+                    {slides.length ? "Заменить слайды ответом" : "Создать слайды из ответа"}
+                  </button>
+                  <p className="hint">
+                    ③ Картинки: кнопка «Картинки в ChatGPT» над слайдами откроет одно задание на всю серию. Скачайте
+                    картинки и перетащите их все разом на область слайдов — они разложатся по порядку.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <label className="check">
+                    <input type="checkbox" checked={autoImages} onChange={(e) => setAutoImages(e.target.checked)} />
+                    Сразу сгенерировать изображения
+                  </label>
+                  <button className="btn btn--primary btn--wide" disabled={busyText} onClick={generateText}>
+                    {busyText ? "Пишу тексты…" : slides.length ? "Перегенерировать карусель" : "Сгенерировать карусель"}
+                  </button>
+                </>
+              )}
               <p className="hint">
                 Совет: 7–10 слайдов, хук на первом, одна мысль на слайд, призыв к действию на последнем. В заголовках
                 **звёздочками** отмечаются акцентные слова.
@@ -662,14 +787,30 @@ export default function App() {
         </aside>
 
         {/* ---------- Слайды ---------- */}
-        <main className="canvas">
+        <main
+          className={`canvas ${dragOver ? "canvas--drop" : ""}`}
+          onDragOver={(e) => {
+            if (!slides.length || !e.dataTransfer.types.includes("Files")) return;
+            e.preventDefault();
+            setDragOver(true);
+          }}
+          onDragLeave={(e) => {
+            if (e.currentTarget === e.target) setDragOver(false);
+          }}
+          onDrop={(e) => {
+            setDragOver(false);
+            if (!slides.length) return;
+            e.preventDefault();
+            bulkUpload(Array.from(e.dataTransfer.files));
+          }}
+        >
           {slides.length === 0 ? (
             <div className="empty">
               <h1>Карусели для Instagram за минуту</h1>
               <p>
-                Опишите тему слева — нейросеть напишет цепляющие тексты по правилам вирусных каруселей и сгенерирует
-                изображения в едином стиле через GPT Image (ChatGPT). Дальше можно править текст, шрифты, цвета и
-                скачать готовые PNG 1080×1350.
+                Опишите тему слева — ChatGPT напишет цепляющие тексты по правилам вирусных каруселей и нарисует
+                изображения в едином стиле. Можно работать через обычный ChatGPT по подписке (без ключа) или
+                автоматически через API-ключ. Дальше правьте текст, шрифты, цвета и скачивайте готовые PNG 1080×1350.
               </p>
               <ol>
                 <li>Хук на первом слайде — до 8 слов</li>
@@ -685,10 +826,31 @@ export default function App() {
                   {slides.length} слайдов · 1080×1350
                 </span>
                 <div className="canvas-actions">
-                  {missingImages.length > 0 && (
-                    <button className="btn" onClick={() => generateImages(missingImages.map((s) => s.id))}>
-                      Сгенерировать недостающие изображения ({missingImages.length})
-                    </button>
+                  {settings.mode === "chatgpt" ? (
+                    <>
+                      <button className="btn btn--primary" onClick={openImagesInChatGPT}>
+                        Картинки в ChatGPT{missingImages.length > 0 ? ` (${missingImages.length})` : ""}
+                      </button>
+                      <label className="btn">
+                        Загрузить картинки
+                        <input
+                          type="file"
+                          accept="image/*"
+                          multiple
+                          hidden
+                          onChange={(e) => {
+                            bulkUpload(Array.from(e.target.files ?? []));
+                            e.target.value = "";
+                          }}
+                        />
+                      </label>
+                    </>
+                  ) : (
+                    missingImages.length > 0 && (
+                      <button className="btn" onClick={() => generateImages(missingImages.map((s) => s.id))}>
+                        Сгенерировать недостающие изображения ({missingImages.length})
+                      </button>
+                    )
                   )}
                   <button className="btn" onClick={addSlide}>
                     + Слайд
@@ -701,6 +863,16 @@ export default function App() {
                     key={s.id}
                     className={`card ${s.id === selectedId ? "card--active" : ""}`}
                     onClick={() => setSelectedId(s.id)}
+                    onDragOver={(e) => e.preventDefault()}
+                    onDrop={(e) => {
+                      const f = Array.from(e.dataTransfer.files).find((x) => x.type.startsWith("image/"));
+                      if (!f) return;
+                      e.preventDefault();
+                      e.stopPropagation();
+                      uploadImage(s.id, f);
+                      setSelectedId(s.id);
+                      setDragOver(false);
+                    }}
                   >
                     <ScaledSlide width={300}>
                       <SlideView
@@ -828,6 +1000,11 @@ export default function App() {
                 />
               </label>
               <div className="btn-row">
+                {settings.mode === "chatgpt" ? (
+                  <button className="btn btn--primary" onClick={() => openChat(fullPrompt(selected, design), "Картинка")}>
+                    Открыть в ChatGPT
+                  </button>
+                ) : (
                 <button
                   className="btn btn--primary"
                   disabled={selected.imageStatus === "loading"}
@@ -839,6 +1016,7 @@ export default function App() {
                       ? "Перегенерировать"
                       : "Сгенерировать"}
                 </button>
+                )}
                 <label className="btn">
                   Загрузить
                   <input

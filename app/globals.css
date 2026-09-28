@@ -949,3 +949,36 @@ input[type="checkbox"] {
   align-items: center;
   font-size: 13px;
 }
+
+/* ---------- Режим генерации ---------- */
+.seg {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+.seg button {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: flex-start;
+  text-align: left;
+  padding: 9px 10px;
+  border-radius: 9px;
+  border: 1px solid var(--ui-border);
+  background: var(--ui-panel-2);
+  cursor: pointer;
+  font-weight: 600;
+}
+.seg button small {
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--ui-muted);
+}
+.seg button.active {
+  border-color: var(--ui-accent);
+  background: rgba(139, 123, 255, 0.14);
+}
+.canvas--drop {
+  outline: 2px dashed var(--ui-accent);
+  outline-offset: -10px;
+}
