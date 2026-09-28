@@ -135,6 +135,7 @@ hr.sep { border: 0; border-top: 1px solid var(--ui-line); margin: 4px 0; width: 
 .artph { position: absolute; border-radius: 26px; overflow: hidden; }
 .artph img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .frame.drop { outline: 3px dashed var(--ui-gold); outline-offset: 3px; }
+.tools input.idea { flex: 1 1 100%; padding: 6px 9px; font-size: 12px; border-radius: 8px; }
 .tools input[type=range] { flex: 1 1 100%; accent-color: var(--ui-gold); }
 </style>
 
@@ -256,7 +257,9 @@ const SVG_OK = new Set(["svg", "g", "path", "circle", "ellipse", "line", "polyli
 function cleanSvg(raw) {
   const m = String(raw || "").match(/<svg[\s\S]*<\/svg>/i);
   if (!m) return "";
-  const doc = new DOMParser().parseFromString(m[0], "image/svg+xml");
+  // без xmlns SVG не откроется как картинка (нужно для самопроверки рисунка)
+  const src = /xmlns=/.test(m[0].slice(0, m[0].indexOf(">"))) ? m[0] : m[0].replace(/^<svg/i, '<svg xmlns="http://www.w3.org/2000/svg"');
+  const doc = new DOMParser().parseFromString(src, "image/svg+xml");
   const root = doc.documentElement;
   if (!root || root.nodeName.toLowerCase() !== "svg" || doc.querySelector("parsererror")) return "";
   const walk = (el) => {
@@ -285,6 +288,8 @@ function paintSvg(svg, pal) {
   const doc = new DOMParser().parseFromString(svg, "image/svg+xml");
   doc.querySelectorAll(".accent").forEach((el) => el.setAttribute("stroke", pal.accent));
   doc.querySelectorAll(".soft").forEach((el) => { el.setAttribute("fill", pal.accent); el.setAttribute("fill-opacity", "0.12"); el.setAttribute("stroke", "none"); });
+  doc.querySelectorAll(".hatch").forEach((el) => { el.setAttribute("stroke-width", "1.2"); el.setAttribute("stroke-opacity", "0.6"); });
+  doc.querySelectorAll(".shade").forEach((el) => { el.setAttribute("fill", "currentColor"); el.setAttribute("fill-opacity", "0.1"); el.setAttribute("stroke", "none"); });
   doc.querySelectorAll(".dot").forEach((el) => { el.setAttribute("fill", pal.accent); el.setAttribute("stroke", "none"); });
   const root = doc.documentElement;
   root.setAttribute("width", "100%"); root.setAttribute("height", "100%");
@@ -294,7 +299,7 @@ function paintSvg(svg, pal) {
 function artBlock(s, box, pal) {
   const pos = `left:${box[0]}px;top:${box[1]}px;width:${box[2]}px;height:${box[3]}px`;
   if (s.art?.svg) return `<div class="art" style="${pos}">${paintSvg(s.art.svg, pal)}</div>`;
-  if (s.art) return `<div class="art-wait" style="${pos}">${s.art.pending ? "рисую…" : "нет графики"}</div>`;
+  if (s.art) return `<div class="art-wait" style="${pos}">${s.art.pending ? (s.art.stage || "рисую…") : "нет графики"}</div>`;
   return "";
 }
 
@@ -383,6 +388,7 @@ function render() {
         <label class="btn-file" title="Своё фото (можно просто перетащить на слайд)"><input type="file" accept="image/*" data-act="photo" hidden>${s.photo ? "другое фото" : "+ фото"}</label>
         ${s.photo ? `<button data-act="nophoto" title="Убрать фото">✕ фото</button>` : `<button data-act="art" ${aiReady ? "" : "disabled"} title="Графика по смыслу">${s.art ? "перерисовать" : "+ графика"}</button>`}
         ${s.art && !s.photo ? `<button data-act="noart" title="Убрать графику">✕</button>` : ""}
+        ${s.art && !s.photo ? `<input class="idea" type="text" data-act="idea" value="${esc(s.art.idea)}" placeholder="что нарисовать, например: лестница вверх" aria-label="Что нарисовать на слайде ${i + 1}">` : ""}
         <button data-act="png" title="Скачать PNG">PNG</button>
         ${s.photo ? `<input type="range" min="0" max="100" value="${s.focus ?? 40}" data-act="focus" aria-label="Кадр фото по вертикали" title="Сдвиг кадра">` : ""}
       </div>
@@ -428,6 +434,11 @@ gallery.addEventListener("drop", (e) => {
   const s = state.slides.find((x) => x.id === f.closest(".card").dataset.id);
   if (e.dataTransfer.files[0]) setPhoto(s, e.dataTransfer.files[0]);
 });
+gallery.addEventListener("keydown", (e) => {
+  if (e.target.dataset?.act !== "idea" || e.key !== "Enter") return;
+  e.preventDefault();
+  e.target.closest(".card").querySelector('button[data-act="art"]')?.click();
+});
 gallery.addEventListener("input", (e) => {
   if (e.target.dataset.act !== "focus") return;
   const card = e.target.closest(".card");
@@ -447,7 +458,7 @@ gallery.addEventListener("change", (e) => {
   if (!card || e.target.dataset.act !== "layout") return;
   const s = state.slides.find((x) => x.id === card.dataset.id);
   s.layout = e.target.value;
-  if (s.layout === "art" && !s.art && !s.photo) s.art = { idea: plain(s.title) };
+  if (s.layout === "art" && !s.art && !s.photo) s.art = { idea: "" };
   render();
   if (s.layout === "art" && !s.photo && s.art && !s.art.svg && aiReady) drawArt(s);
 });
@@ -457,7 +468,11 @@ gallery.addEventListener("click", (e) => {
   const s = state.slides.find((x) => x.id === btn.closest(".card").dataset.id);
   const act = btn.dataset.act;
   if (act === "tone") { s.tone = s.tone === "light" ? "dark" : "light"; render(); }
-  if (act === "art") { s.art = { idea: s.art?.idea || plain(s.title || s.big) }; drawArt(s, true); }
+  if (act === "art") {
+    const typed = btn.closest(".card").querySelector("input.idea")?.value.trim();
+    s.art = { idea: typed ?? s.art?.idea ?? "" };
+    drawArt(s, true);
+  }
   if (act === "nophoto") { s.photo = null; if (s.layout === "photo") s.layout = "statement"; render(); }
   if (act === "noart") { s.art = null; if (s.layout === "art") s.layout = "statement"; render(); }
   if (act === "png") exportOne(s);
@@ -475,7 +490,7 @@ handleEl.value = state.handle;
 handleEl.addEventListener("input", () => { state.handle = handleEl.value; render(); });
 
 // ---------- Claude ----------
-let sample = null, aiReady = false;
+let sample = null, aiReady = false, canSeeImages = false;
 const statusEl = document.getElementById("status");
 function setStatus(t, kind) { statusEl.textContent = t; statusEl.className = "status" + (kind ? " " + kind : ""); }
 const ERR = {
@@ -487,6 +502,7 @@ const ERR = {
 };
 const errText = (e) => ERR[e?.code] || "Не получилось связаться с Claude — попробуйте ещё раз.";
 
+const IDEA_RULE = `art.idea — КОНКРЕТНЫЙ узнаваемый предмет или сцена, которые прямо названы в тексте слайда или однозначно его иллюстрируют (лестница, чашка кофе, телефон, песочные часы, открытая дверь, ключ, часы, свеча, горы, скамейка). Если в тексте есть предмет — рисуй именно его. Никаких абстракций, «энергий», геометрии и символов. Формулируй как задание иллюстратору: предмет + ракурс + одна деталь, например «деревянная лестница, уходящая вверх, вид сбоку» или «телефон экраном вверх рядом с остывшей чашкой кофе».`;
 const SCHEMA = `{"slides":[{"layout":"cover|statement|text|box|quote|list|number|art|cta","tone":"light|dark","lead":"","title":"","body":"","items":[""],"note":"","big":"","art":{"idea":""}|null}]}`;
 const LAYOUT_GUIDE = `Макеты (поле layout):
 - cover — обложка: title (хук, крупно капсом), body (подзаголовок справа). Первый слайд всегда cover, tone "dark", art обязателен.
@@ -510,7 +526,7 @@ function layoutPrompt(text) {
 3. В каждом слайде выдели **двойными звёздочками** 1–2 ключевых фрагмента (в заголовке они станут цветными, в тексте — жирными).
 4. Чередуй tone: light и dark, но можно поставить два тёмных подряд ради драматургии. Обложка и финал — dark.
 5. Подбирай разнообразные макеты под смысл, не повторяй один макет больше трёх раз подряд.
-6. Поле art ставь только на 2–4 слайдах, где визуальная метафора реально усиливает мысль (обложка — всегда). art.idea — одна фраза: какой минималистичный образ нарисовать тонкой линией (предмет или метафора, без людей и текста). Остальным — "art": null.
+6. Поле art ставь только на 2–4 слайдах, где картинка реально усиливает мысль (обложка — всегда). ${IDEA_RULE} Остальным — "art": null.
 7. Пустые поля — пустые строки или пустой массив.
 
 ${LAYOUT_GUIDE}
@@ -522,25 +538,46 @@ ${SCHEMA}
 ${text}`;
 }
 
-function artPrompt(idea, context) {
-  return `Нарисуй минималистичную линейную иллюстрацию для слайда Instagram-карусели в эстетике тонкой журнальной графики.
-Образ: ${idea}
-Смысл слайда: ${context}
+const SVG_RULES = `Технические правила SVG:
+- Корень: <svg viewBox="0 0 800 800" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+- Только элементы path, circle, ellipse, line, polyline, polygon, rect, g. Никакого текста, style, script, image, filter, gradient, href.
+- class="hatch" — тонкая штриховка для объёма и теней; class="shade" — мягкая заливка тени (1–3 штуки); class="accent" — 1–3 смысловые детали акцентным цветом. Других цветов и заливок нет.
+- 40–200 элементов. Ответ — только код <svg>…</svg>, без пояснений.`;
 
-Требования к SVG:
-- <svg viewBox="0 0 800 800" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-- Только элементы path, circle, ellipse, line, polyline, polygon, rect, g. Никакого текста, style, script, изображений, градиентов и href.
-- Тонкие плавные линии, много пустого пространства, композиция по центру с полями ~80px, 8–40 элементов.
-- 1–3 элемента с class="accent" (акцентная линия), по желанию один крупный фон-круг или пятно class="soft" и точки class="dot". Никаких других цветов и заливок.
-- Элегантно и узнаваемо: образ должен читаться с первого взгляда на телефоне.
-Ответ — только код <svg>…</svg>, без пояснений.`;
+function artPrompt(idea, context) {
+  return `Ты — книжный иллюстратор. Нарисуй в SVG УЗНАВАЕМУЮ линейную иллюстрацию реального предмета или сцены для слайда Instagram-карусели.
+Что изобразить: ${idea}
+Текст слайда (для настроения): ${context}
+
+Это должна быть настоящая иллюстрация, как в хорошей книге или журнале: предмет понятен с первого взгляда даже на маленьком экране телефона. НЕ абстракция, НЕ набор геометрических фигур, НЕ символ или значок.
+
+Как рисовать:
+1. Сначала продумай предмет: реальные пропорции, лёгкая перспектива (ракурс 3/4 или сбоку, если так понятнее), характерные детали, по которым его узнают (у лестницы — ступени одинаковой высоты, тетива и перила со стойками; у чашки — ручка, блюдце, пар; у двери — полотно, ручка, проём и свет из него).
+2. Контуры — точные линии и плавные кривые Безье, повторяющиеся элементы (ступени, стойки, окна) — ровные и одинаковые, всё соединено без разрывов.
+3. Объём — штриховка короткими параллельными линиями (class="hatch") и одна-две мягкие тени (class="shade"), в том числе тень под предметом.
+4. Смысл — 1–3 детали акцентом (class="accent"): то, на что должен упасть взгляд.
+5. Композиция: предмет занимает 60–80% кадра, по центру, поля около 60px, без рамок и без фона.
+
+${SVG_RULES}`;
+}
+
+function reviewPrompt(idea, svg) {
+  return `На картинке — SVG-иллюстрация, которая должна изображать: ${idea}.
+Строго оцени её как арт-директор: узнаётся ли предмет с первого взгляда, правильные ли пропорции и перспектива, нет ли кривых, разорванных или лишних линий, не похоже ли на абстрактные фигуры.
+Если всё хорошо — ответь одним словом OK.
+Если есть проблемы — нарисуй исправленную версию с нуля и ответь только её кодом.
+
+${SVG_RULES}
+
+Текущий код:
+${svg}`;
 }
 
 function editPrompt(instruction) {
   const current = state.slides.map(({ layout, tone, lead, title, body, items, note, big, art, photo }) => ({ layout, tone, lead, title, body, items, note, big, art: art ? { idea: art.idea } : null, hasPhoto: !!photo }));
   return `Ты редактируешь Instagram-карусель. Вот текущие слайды (JSON) и просьба автора. Внеси ровно то, что просят, остальное оставь как есть. Слова автора не переписывай, если об этом не просят.
 Поле hasPhoto — у слайда есть фото автора: сохраняй его у того же по смыслу слайда (верни "hasPhoto": true), фото не заменяется графикой.
-Если нужна новая или другая графика на слайде — укажи art.idea и добавь "redraw": true внутрь art. Если графику не трогали — оставь art как был.
+Если нужна новая или другая графика на слайде — укажи art.idea (${IDEA_RULE}) и добавь "redraw": true внутрь art. Если графику не трогали — оставь art как был.
 
 ${LAYOUT_GUIDE}
 
@@ -575,22 +612,65 @@ function drawArt(s, fresh = false) {
   artQueue.push({ s, fresh });
   pumpArt();
 }
+// SVG → PNG, чтобы Claude мог посмотреть на свой рисунок
+function svgToPng(svg) {
+  return new Promise((resolve, reject) => {
+    const doc = new DOMParser().parseFromString(paintSvg(svg, { accent: "#9a6b2f" }), "image/svg+xml");
+    const root = doc.documentElement;
+    root.setAttribute("width", "800"); root.setAttribute("height", "800"); root.setAttribute("color", "#2a1f17");
+    const painted = new XMLSerializer().serializeToString(root);
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement("canvas");
+      c.width = c.height = 800;
+      const x = c.getContext("2d");
+      x.fillStyle = "#fbf7f1"; x.fillRect(0, 0, 800, 800);
+      x.drawImage(img, 0, 0, 800, 800);
+      c.toBlob((b) => (b ? resolve(b) : reject()), "image/png");
+    };
+    img.onerror = reject;
+    img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(painted);
+  });
+}
+
+async function makeArt(s, fresh) {
+  const ctx = [s.lead, s.title, s.body, s.big].map(plain).filter(Boolean).join(" ");
+  if (!s.art.idea.trim()) {
+    const { text } = await sample(`Назови один конкретный узнаваемый предмет или простую сцену для иллюстрации к фразе: «${ctx}». ${IDEA_RULE} Ответ — только это описание, 3–10 слов.`, { modelTier: "quick" });
+    s.art.idea = text.trim().replace(/^[«"]|[»".]$/g, "");
+  }
+  const { text } = await sample(artPrompt(s.art.idea, ctx), fresh ? { modelTier: "complex", cache: false } : { modelTier: "complex" });
+  let svg = cleanSvg(text);
+  if (!svg) throw { code: "invalid_json" };
+  if (canSeeImages) {
+    try {
+      s.art.stage = "проверяю рисунок…"; renderSoon();
+      const png = await svgToPng(svg);
+      const review = await sample(reviewPrompt(s.art.idea, svg), { images: png, cache: false });
+      if (!/^\s*OK\b/i.test(review.text)) svg = cleanSvg(review.text) || svg;
+    } catch (e) {
+      if (e?.code === "not_granted" || e?.code === "rate_limited") throw e;
+    }
+  }
+  return svg;
+}
+
+let renderTimer = 0;
+function renderSoon() { clearTimeout(renderTimer); renderTimer = setTimeout(render, 50); }
+
 function pumpArt() {
   while (artRunning < 2 && artQueue.length) {
     const { s, fresh } = artQueue.shift();
     artRunning++;
-    const ctx = [s.title, s.body, s.big].map(plain).filter(Boolean).join(" ");
-    sample(artPrompt(s.art.idea, ctx), fresh ? { cache: false } : {})
-      .then(({ text }) => {
-        const svg = cleanSvg(text);
-        if (!svg) throw { code: "invalid_json" };
-        s.art = { idea: s.art.idea, svg };
-      })
+    makeArt(s, fresh)
+      .then((svg) => { s.art = { idea: s.art.idea, svg }; })
       .catch((e) => { s.art = { idea: s.art.idea, svg: "" }; setStatus("Графика: " + errText(e), "err"); })
       .finally(() => {
         artRunning--;
         render();
-        if (!artRunning && !artQueue.length && !statusEl.classList.contains("err")) setStatus("Готово. Правьте словами или меняйте макеты под слайдами.");
+        const left = artQueue.length + artRunning;
+        if (left && !statusEl.classList.contains("err")) setStatus(`Рисую графику, осталось: ${left}…`, "busy");
+        if (!left && !statusEl.classList.contains("err")) setStatus("Готово. Правьте словами или меняйте макеты под слайдами.");
         pumpArt();
       });
   }
@@ -713,6 +793,7 @@ document.fonts?.ready.then(render);
   if (!c?.use) { document.getElementById("aiNote").hidden = false; goBtn.disabled = applyBtn.disabled = true; return; }
   const [s, d] = await Promise.all([c.use("sample"), c.use("downloads")]);
   sample = s; downloads = d; aiReady = !!s;
+  if (s) canSeeImages = !!(await s.limits().catch(() => null))?.images;
   if (!aiReady) { document.getElementById("aiNote").hidden = false; goBtn.disabled = applyBtn.disabled = true; }
   render();
 })();
