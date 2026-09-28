@@ -48,12 +48,16 @@ export interface Design {
   showSwipe: boolean;
   imageStyleId: string;
   customImageStyle: string;
+  /** Подгонять цвета изображений под палитру слайдов */
+  matchImageColors: boolean;
+  themeId: string;
 }
 
 export interface Brief {
   topic: string;
   audience: string;
   goal: string;
+  format: string;
   tone: string;
   slideCount: number;
   language: string;

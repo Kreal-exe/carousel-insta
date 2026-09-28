@@ -1,6 +1,6 @@
 "use client";
 
-import { forwardRef, type CSSProperties, type ReactNode } from "react";
+import { forwardRef, useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { fontCss } from "@/lib/presets";
 import type { Design, LayoutId, Slide } from "@/lib/types";
 import { SLIDE_H, SLIDE_W } from "@/lib/types";
@@ -16,7 +16,8 @@ export function resolveLayout(slide: Slide, design: Design): LayoutId {
 function typograph(text: string): string {
   return text
     .replace(/(?<=^|[\s(«"])([а-яёa-z]{1,2})\s+/gi, "$1\u00A0")
-    .replace(/\s+([—–])\s/g, "\u00A0$1 ");
+    .replace(/\s+([—–])\s/g, "\u00A0$1 ")
+    .replace(/(\d+)\s+(?=[^\s\d])/g, "$1\u00A0");
 }
 
 /** **слово** → выделение */
@@ -62,8 +63,43 @@ export const SlideView = forwardRef<HTMLDivElement, Props>(function SlideView(
 ) {
   const layout = resolveLayout(slide, design);
   const isLast = index === total - 1;
-  const tSize = titleSize(slide, layout, design.titleScale);
-  const bodySize = slide.kind === "cover" ? 38 : layout === "minimal" ? 40 : 36;
+
+  // Автоподгонка: если текст не влезает в свою зону, уменьшаем кегль ступенями по 8%
+  const [fit, setFit] = useState(1);
+  const [numClash, setNumClash] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const setRefs = useCallback(
+    (el: HTMLDivElement | null) => {
+      rootRef.current = el;
+      if (typeof ref === "function") ref(el);
+      else if (ref) ref.current = el;
+    },
+    [ref],
+  );
+  const fitKey = [
+    slide.title, slide.body, slide.eyebrow, slide.kind, layout, design.titleScale,
+    design.headingFont, design.bodyFont, design.uppercaseTitles, design.align, design.showCounter,
+  ].join("|");
+  useLayoutEffect(() => setFit(1), [fitKey]);
+  useEffect(() => {
+    document.fonts?.ready.then(() => setFit(1));
+  }, []);
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    const text = root?.querySelector<HTMLElement>(".s-text");
+    if (!root || !text) return;
+    const top = text.offsetTop;
+    const bottom = top + text.offsetHeight;
+    const frameImg = root.querySelector<HTMLElement>(".s-frame-img");
+    const overflow = top < 150 || bottom > SLIDE_H - 120 || (frameImg !== null && frameImg.offsetHeight < 420);
+    if (overflow && fit > 0.5) setFit((f) => Math.round(f * 0.92 * 100) / 100);
+    // крупная декоративная цифра не должна залезать под заголовок
+    const clash = top < 330;
+    if (clash !== numClash) setNumClash(clash);
+  });
+
+  const tSize = Math.round(titleSize(slide, layout, design.titleScale) * fit);
+  const bodySize = Math.round((slide.kind === "cover" ? 38 : layout === "minimal" ? 40 : 36) * Math.max(fit, 0.75));
 
   const style = {
     width: SLIDE_W,
@@ -85,7 +121,7 @@ export const SlideView = forwardRef<HTMLDivElement, Props>(function SlideView(
       className="s-img"
       src={slide.image}
       alt=""
-      style={{ objectPosition: `50% ${slide.imageFocus ?? 50}%` }}
+      style={{ width: "100%", height: "100%", objectPosition: `50% ${slide.imageFocus ?? 50}%` }}
     />
   ) : (
     <div className="s-img s-img--empty">
@@ -95,6 +131,7 @@ export const SlideView = forwardRef<HTMLDivElement, Props>(function SlideView(
 
   const text = (
     <div className="s-text">
+      {layout === "minimal" && slide.kind === "content" && <div className="s-rule" style={{ width: 96, height: 8 }} />}
       {slide.eyebrow && <div className="s-eyebrow">{slide.eyebrow}</div>}
       {slide.title && <h2 className="s-title">{rich(slide.title)}</h2>}
       {slide.body && <p className="s-body">{rich(slide.body)}</p>}
@@ -102,13 +139,13 @@ export const SlideView = forwardRef<HTMLDivElement, Props>(function SlideView(
   );
 
   const bigNumber =
-    layout === "minimal" && slide.kind === "content" ? (
+    layout === "minimal" && slide.kind === "content" && !numClash ? (
       <div className="s-bignum">{String(index).padStart(2, "0")}</div>
     ) : null;
 
   return (
     <div
-      ref={ref}
+      ref={setRefs}
       className={[
         "slide",
         `slide--${layout}`,
@@ -140,7 +177,7 @@ export const SlideView = forwardRef<HTMLDivElement, Props>(function SlideView(
 
       {layout === "split" && (
         <>
-          <div className="s-split-img">{image}</div>
+          <div className="s-split-img" style={{ height: 740 }}>{image}</div>
           {text}
         </>
       )}

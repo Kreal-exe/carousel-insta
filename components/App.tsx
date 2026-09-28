@@ -8,20 +8,24 @@ import {
   DEFAULT_DESIGN,
   DEFAULT_SETTINGS,
   FONTS,
+  FORMATS,
   GOALS,
+  THEMES,
   IMAGE_STYLES,
   LAYOUTS,
   PALETTES,
   TONES,
   imageStylePrompt,
+  fontCss,
   pickPalette,
 } from "@/lib/presets";
 import { buildImagePrompt } from "@/lib/imagePrompt";
-import { generateCarousel, generateImage as requestImage } from "@/lib/openai";
+import { generateCarousel, generateImage as requestImage, generateTitleVariants } from "@/lib/openai";
 import { loadProject, loadSettings, saveProject, saveSettings } from "@/lib/storage";
 import type { Brief, Design, LayoutId, Project, Settings, Slide, SlideKind } from "@/lib/types";
 import { SLIDE_H, SLIDE_W } from "@/lib/types";
 import { ScaledSlide, SlideView, resolveLayout } from "./SlideView";
+import { InstagramPreview } from "./InstagramPreview";
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 
@@ -54,6 +58,8 @@ export default function App() {
   const [exporting, setExporting] = useState(false);
   const [autoImages, setAutoImages] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
+  const [showPreview, setShowPreview] = useState(false);
+  const [variants, setVariants] = useState<{ slideId: string; titles: string[]; loading: boolean } | null>(null);
   const [toast, setToast] = useState<{ kind: "error" | "info"; text: string } | null>(null);
   const slideRefs = useRef(new Map<string, HTMLDivElement>());
   const projectRef = useRef(project);
@@ -66,7 +72,7 @@ export default function App() {
       if (p) {
         // незавершённые генерации после перезагрузки сбрасываем
         const slides = p.slides.map((s) => (s.imageStatus === "loading" ? { ...s, imageStatus: "idle" as const } : s));
-        setProject({ ...EMPTY_PROJECT, ...p, design: { ...DEFAULT_DESIGN, ...p.design }, slides });
+        setProject({ ...EMPTY_PROJECT, ...p, brief: { ...DEFAULT_BRIEF, ...p.brief }, design: { ...DEFAULT_DESIGN, ...p.design }, slides });
         setSelectedId(slides[0]?.id ?? null);
       }
       setLoaded(true);
@@ -161,12 +167,33 @@ export default function App() {
     }
   }
 
+  async function suggestTitles(slide: Slide) {
+    if (!settings.apiKey.trim()) {
+      setShowSettings(true);
+      return;
+    }
+    setVariants({ slideId: slide.id, titles: [], loading: true });
+    try {
+      const { slides: all, brief: b } = projectRef.current;
+      const titles = await generateTitleVariants(slide, all, b, settings.apiKey, settings.textModel);
+      setVariants({ slideId: slide.id, titles, loading: false });
+    } catch (e) {
+      setVariants(null);
+      setToast({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
   // --- экспорт ---
   async function renderPng(id: string): Promise<string> {
     const node = slideRefs.current.get(id);
     if (!node) throw new Error("Слайд не найден");
     await document.fonts.ready;
-    const opts = { width: SLIDE_W, height: SLIDE_H, pixelRatio: 1, cacheBust: false };
+    // Не переносим в клон вычисленные width/height: иначе блок с текстом сохраняет высоту из превью,
+    // а в экспорте строки переносятся чуть иначе — появляются пустые полосы. Нужные размеры заданы inline.
+    const includeStyleProperties = Array.from(getComputedStyle(document.documentElement)).filter(
+      (p) => !["width", "height", "inline-size", "block-size"].includes(p),
+    );
+    const opts = { width: SLIDE_W, height: SLIDE_H, pixelRatio: 1, cacheBust: false, includeStyleProperties };
     // первый прогон прогревает шрифты/картинки (известная особенность html-to-image)
     await toPng(node, opts);
     return toPng(node, opts);
@@ -281,6 +308,9 @@ export default function App() {
           {loadingCount > 0 && <span className="pill pill--busy">Изображения: {loadingCount} в работе</span>}
           {slides.length > 0 && (
             <>
+              <button className="btn" onClick={() => setShowPreview(true)}>
+                ▶ Просмотр
+              </button>
               <button className="btn btn--ghost" onClick={resetProject}>
                 Новая
               </button>
@@ -328,6 +358,16 @@ export default function App() {
                   value={brief.audience}
                   onChange={(e) => setBrief({ audience: e.target.value })}
                 />
+              </label>
+              <label>
+                Формат
+                <select value={brief.format} onChange={(e) => setBrief({ format: e.target.value })}>
+                  {FORMATS.map((f) => (
+                    <option key={f.id} value={f.id}>
+                      {f.label}
+                    </option>
+                  ))}
+                </select>
               </label>
               <div className="row">
                 <label>
@@ -388,6 +428,28 @@ export default function App() {
 
           {tab === "design" && (
             <div className="form">
+              <div className="field-title">Тема</div>
+              <div className="themes">
+                {THEMES.map((t) => {
+                  const d = { ...design, ...t.design };
+                  return (
+                    <button
+                      key={t.id}
+                      className={`theme ${design.themeId === t.id ? "active" : ""}`}
+                      style={{ background: d.bg, color: d.text }}
+                      onClick={() => setDesign({ ...t.design, themeId: t.id })}
+                    >
+                      <span className="theme-aa" style={{ fontFamily: fontCss(d.headingFont) }}>
+                        Аа<i style={{ color: d.accent }}>.</i>
+                      </span>
+                      <span className="theme-name" style={{ fontFamily: fontCss(d.bodyFont) }}>
+                        {t.label}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+
               <div className="field-title">Палитра</div>
               <div className="palettes">
                 {PALETTES.map((p) => (
@@ -518,6 +580,15 @@ export default function App() {
                   onChange={(e) => setDesign({ customImageStyle: e.target.value })}
                 />
               )}
+
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={design.matchImageColors}
+                  onChange={(e) => setDesign({ matchImageColors: e.target.checked })}
+                />
+                Подгонять цвета картинок под палитру
+              </label>
 
               <div className="field-title">Элементы</div>
               <label>
@@ -718,6 +789,26 @@ export default function App() {
                   onChange={(e) => updateSlide(selected.id, { title: e.target.value })}
                 />
               </label>
+              <button
+                className="btn btn--ghost"
+                disabled={variants?.slideId === selected.id && variants.loading}
+                onClick={() => suggestTitles(selected)}
+              >
+                {variants?.slideId === selected.id && variants.loading
+                  ? "Придумываю…"
+                  : selected.kind === "cover"
+                    ? "✨ 5 вариантов хука"
+                    : "✨ 5 вариантов заголовка"}
+              </button>
+              {variants?.slideId === selected.id && variants.titles.length > 0 && (
+                <div className="variants">
+                  {variants.titles.map((t) => (
+                    <button key={t} onClick={() => updateSlide(selected.id, { title: t })}>
+                      {t.replace(/\*\*/g, "")}
+                    </button>
+                  ))}
+                </div>
+              )}
               <label>
                 Текст
                 <textarea
@@ -866,6 +957,10 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {showPreview && (
+        <InstagramPreview project={project} onClose={() => setShowPreview(false)} />
       )}
 
       {toast && (

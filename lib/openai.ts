@@ -1,6 +1,7 @@
 "use client";
 
-import type { Brief, GeneratedCarousel } from "./types";
+import type { Brief, GeneratedCarousel, Slide } from "./types";
+import { FORMATS } from "./presets";
 import { imageSizeFor } from "./imagePrompt";
 
 // Приложение статическое (GitHub Pages), поэтому запросы к OpenAI идут прямо из браузера
@@ -83,6 +84,7 @@ export async function generateCarousel(brief: Brief, apiKey: string, model: stri
     `Тема: ${brief.topic}`,
     brief.audience && `Целевая аудитория: ${brief.audience}`,
     `Цель поста: ${brief.goal}`,
+    `Формат: ${(FORMATS.find((f) => f.id === brief.format) ?? FORMATS[0]).prompt}`,
     `Тон: ${brief.tone}`,
     `Язык текста на слайдах и подписи: ${brief.language || "русский"}`,
     `Количество слайдов: ровно ${count} (1 cover, ${count - 2} content, 1 cta).`,
@@ -91,7 +93,7 @@ export async function generateCarousel(brief: Brief, apiKey: string, model: stri
     .filter(Boolean)
     .join("\n");
 
-  const completion = await call<{ choices: Array<{ message: { content: string | null } }> }>(
+  const completion = await call<ChatResponse>(
     "/chat/completions",
     apiKey,
     {
@@ -108,6 +110,51 @@ export async function generateCarousel(brief: Brief, apiKey: string, model: stri
   const data = JSON.parse(content) as GeneratedCarousel;
   data.hashtags = data.hashtags.map((h) => h.replace(/^#/, "").replace(/\s+/g, ""));
   return data;
+}
+
+type ChatResponse = { choices: Array<{ message: { content: string | null } }> };
+
+/** 5 альтернативных заголовков для слайда (для обложки — варианты хука) */
+export async function generateTitleVariants(
+  slide: Slide,
+  slides: Slide[],
+  brief: Brief,
+  apiKey: string,
+  model: string,
+): Promise<string[]> {
+  const context = slides.map((s, i) => `${i + 1}. [${s.kind}] ${s.title.replace(/\*\*/g, "")}`).join("\n");
+  const task =
+    slide.kind === "cover"
+      ? "Придумай 5 сильных альтернативных ХУКОВ для обложки: разные приёмы — цифра, контринтуитивное утверждение, обещание результата, провокационный вопрос, «ошибка, которую делают все». До 8 слов."
+      : slide.kind === "cta"
+        ? "Придумай 5 вариантов заголовка для финального слайда с призывом (сохранить / поделиться / написать в директ). До 7 слов."
+        : "Придумай 5 альтернативных заголовков для этого слайда: короче, точнее, цепляюще. До 7 слов.";
+  const res = await call<ChatResponse>("/chat/completions", apiKey, {
+    model: model || "gpt-5.5",
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      {
+        role: "user",
+        content: `Тема карусели: ${brief.topic}\nТон: ${brief.tone}\nЯзык: ${brief.language || "русский"}\nВсе слайды:\n${context}\n\nТекущий слайд: «${slide.title}» — ${slide.body}\n\n${task} Выдели 1–2 ключевых слова **звёздочками**.`,
+      },
+    ],
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: "variants",
+        strict: true,
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["titles"],
+          properties: { titles: { type: "array", items: { type: "string" } } },
+        },
+      },
+    },
+  });
+  const content = res.choices?.[0]?.message?.content;
+  if (!content) throw new Error("Модель вернула пустой ответ");
+  return (JSON.parse(content) as { titles: string[] }).titles.slice(0, 5);
 }
 
 export async function generateImage(

@@ -109,10 +109,22 @@ export const GOALS = [
   "Продажи (переход в директ / по ссылке)",
 ];
 
+// Форматы, которые лучше всего работают в каруселях
+export const FORMATS: Array<{ id: string; label: string; prompt: string }> = [
+  { id: "auto", label: "Подобрать под тему", prompt: "Выбери формат, который лучше всего раскроет тему." },
+  { id: "list", label: "Список: «N ошибок / привычек / идей»", prompt: "Формат-список: каждый content-слайд — один пункт, eyebrow вида «Ошибка 1», «Совет 2» и т.п." },
+  { id: "steps", label: "Пошаговый гайд", prompt: "Формат пошаговой инструкции: каждый content-слайд — один шаг с конкретным действием, eyebrow «Шаг N»." },
+  { id: "myths", label: "Миф vs правда", prompt: "Формат «миф и правда»: в заголовке — распространённый миф, в body — как на самом деле; eyebrow «Миф N»." },
+  { id: "beforeafter", label: "Было / стало", prompt: "Формат «было → стало»: противопоставляй неправильный и правильный подход на каждом слайде." },
+  { id: "story", label: "История / кейс", prompt: "Формат сторителлинга: завязка-проблема, путь, поворот, результат, вывод. Пиши живо, от первого лица." },
+  { id: "checklist", label: "Чек-лист для сохранения", prompt: "Формат чек-листа: короткие конкретные пункты, которые хочется сохранить и применить; eyebrow «Пункт N»." },
+];
+
 export const DEFAULT_BRIEF: Brief = {
   topic: "",
   audience: "",
   goal: GOALS[0],
+  format: "auto",
   tone: TONES[1],
   slideCount: 8,
   language: "русский",
@@ -137,7 +149,85 @@ export const DEFAULT_DESIGN: Design = {
   showSwipe: true,
   imageStyleId: "cinematic",
   customImageStyle: "",
+  matchImageColors: true,
+  themeId: "editorial",
 };
+
+// Темы: проверенные сочетания шрифтов, палитры, макетов и стиля картинок
+export const THEMES: Array<{ id: string; label: string; design: Partial<Design> }> = [
+  {
+    id: "editorial",
+    label: "Журнал",
+    design: {
+      paletteId: "noir", ...pickPalette("noir"), headingFont: "playfair", bodyFont: "manrope", highlight: "italic",
+      coverLayout: "overlay", layout: "minimal", ctaLayout: "overlay", uppercaseTitles: false, align: "left",
+      imageStyleId: "cinematic", overlay: 0.65,
+    },
+  },
+  {
+    id: "bold",
+    label: "Дерзкий",
+    design: {
+      paletteId: "lilac", ...pickPalette("lilac"), headingFont: "unbounded", bodyFont: "manrope", highlight: "marker",
+      coverLayout: "frame", layout: "minimal", ctaLayout: "minimal", uppercaseTitles: false, align: "left",
+      imageStyleId: "3d", overlay: 0.6,
+    },
+  },
+  {
+    id: "soft",
+    label: "Нежный",
+    design: {
+      paletteId: "blush", ...pickPalette("blush"), headingFont: "cormorant", bodyFont: "manrope", highlight: "italic",
+      coverLayout: "overlay", layout: "split", ctaLayout: "minimal", uppercaseTitles: false, align: "center",
+      imageStyleId: "editorial", overlay: 0.7,
+    },
+  },
+  {
+    id: "clean",
+    label: "Чистый",
+    design: {
+      paletteId: "paper", ...pickPalette("paper"), headingFont: "inter", bodyFont: "inter", highlight: "color",
+      coverLayout: "frame", layout: "minimal", ctaLayout: "minimal", uppercaseTitles: false, align: "left",
+      imageStyleId: "illustration", overlay: 0.6,
+    },
+  },
+  {
+    id: "nature",
+    label: "Природа",
+    design: {
+      paletteId: "forest", ...pickPalette("forest"), headingFont: "lora", bodyFont: "manrope", highlight: "italic",
+      coverLayout: "overlay", layout: "frame", ctaLayout: "overlay", uppercaseTitles: false, align: "left",
+      imageStyleId: "flatlay", overlay: 0.7,
+    },
+  },
+  {
+    id: "poster",
+    label: "Постер",
+    design: {
+      paletteId: "terracotta", ...pickPalette("terracotta"), headingFont: "oswald", bodyFont: "rubik", highlight: "color",
+      coverLayout: "overlay", layout: "minimal", ctaLayout: "minimal", uppercaseTitles: true, align: "left",
+      imageStyleId: "collage", overlay: 0.7,
+    },
+  },
+  {
+    id: "night",
+    label: "Ночь",
+    design: {
+      paletteId: "ocean", ...pickPalette("ocean"), headingFont: "montserrat", bodyFont: "inter", highlight: "color",
+      coverLayout: "overlay", layout: "overlay", ctaLayout: "minimal", uppercaseTitles: false, align: "left",
+      imageStyleId: "neon", overlay: 0.75,
+    },
+  },
+  {
+    id: "warm",
+    label: "Тёплый",
+    design: {
+      paletteId: "cream", ...pickPalette("cream"), headingFont: "playfair", bodyFont: "manrope", highlight: "italic",
+      coverLayout: "split", layout: "minimal", ctaLayout: "split", uppercaseTitles: false, align: "left",
+      imageStyleId: "editorial", overlay: 0.6,
+    },
+  },
+];
 
 export const DEFAULT_SETTINGS: Settings = {
   apiKey: "",
@@ -151,7 +241,13 @@ export function pickPalette(id: string) {
   return { bg: p.bg, surface: p.surface, text: p.text, muted: p.muted, accent: p.accent };
 }
 
-export function imageStylePrompt(design: Pick<Design, "imageStyleId" | "customImageStyle">): string {
-  if (design.imageStyleId === "custom") return design.customImageStyle.trim();
-  return IMAGE_STYLES.find((s) => s.id === design.imageStyleId)?.prompt ?? "";
+export function imageStylePrompt(
+  design: Pick<Design, "imageStyleId" | "customImageStyle" | "matchImageColors" | "bg" | "accent">,
+): string {
+  const base =
+    design.imageStyleId === "custom"
+      ? design.customImageStyle.trim()
+      : (IMAGE_STYLES.find((s) => s.id === design.imageStyleId)?.prompt ?? "");
+  if (!design.matchImageColors) return base;
+  return [base, `color palette harmonizing with ${design.bg} and ${design.accent} tones`].filter(Boolean).join(", ");
 }
