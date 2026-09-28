@@ -739,3 +739,7 @@ input[type="checkbox"] {
 .slide--minimal.slide--cover .s-title {
   font-size: calc(var(--title-size) * 1.08);
 }
+
+.hint a {
+  color: var(--ui-accent);
+}

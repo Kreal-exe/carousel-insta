@@ -75,7 +75,7 @@ export interface Project {
   hashtags: string[];
 }
 
-/** Ответ /api/generate-text */
+/** Ответ модели с текстами карусели */
 export interface GeneratedCarousel {
   slides: Array<{
     kind: SlideKind;

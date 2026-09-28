@@ -9,17 +9,31 @@
 
 ![Скриншот](docs/screenshot.png)
 
-## Запуск
+## Сайт
+
+Приложение полностью статическое и автоматически публикуется на **GitHub Pages** при каждом пуше
+(workflow `.github/workflows/deploy.yml`): `https://kreal-exe.github.io/carousel-insta/`.
+
+При первом открытии нажмите ⚙ и вставьте свой [API-ключ OpenAI](https://platform.openai.com/api-keys).
+Ключ хранится только в вашем браузере (localStorage) и отправляется напрямую в `api.openai.com` — никакого
+промежуточного сервера нет. Не открывайте приложение со своим ключом на чужих компьютерах.
+
+> Для моделей GPT Image OpenAI может требовать [верификацию организации](https://platform.openai.com/settings/organization/general). Без неё генерация картинок вернёт 403.
+
+### Включение GitHub Pages (один раз)
+
+1. **Settings → Pages → Build and deployment → Source: GitHub Actions.**
+2. Pages для приватного репозитория доступен только на GitHub Pro/Team — иначе сделайте репозиторий публичным
+   (**Settings → General → Danger Zone → Change visibility**). Ключей в коде нет, это безопасно.
+3. **Actions → Deploy to GitHub Pages → Run workflow** (или любой пуш).
+
+### Локально
 
 ```bash
 npm install
-cp .env.example .env.local   # впишите OPENAI_API_KEY (или введите ключ в настройках ⚙ приложения)
-npm run dev                  # http://localhost:3000
+npm run dev        # http://localhost:3000
+npm run build      # статический сайт в out/
 ```
-
-Продакшн: `npm run build && npm start`. Приложение можно задеплоить на Vercel — задайте `OPENAI_API_KEY` в переменных окружения.
-
-> Для моделей GPT Image OpenAI может требовать [верификацию организации](https://platform.openai.com/settings/organization/general). Без неё генерация картинок вернёт 403.
 
 ### Настройки (⚙)
 
@@ -57,11 +71,10 @@ npm run dev                  # http://localhost:3000
 
 ## Стек
 
-Next.js 16 (App Router) · React 19 · TypeScript · `openai` SDK · `html-to-image` · `jszip`. Шрифты самохостятся через `next/font`, поэтому корректно встраиваются в PNG.
+Next.js 16 (static export) · React 19 · TypeScript · OpenAI REST API · `html-to-image` · `jszip`. Шрифты самохостятся через `next/font`, поэтому корректно встраиваются в PNG.
 
 ```
-app/api/generate-text   — тексты карусели (chat.completions + JSON Schema)
-app/api/generate-image  — изображения (images.generate)
+lib/openai              — запросы к OpenAI из браузера (тексты + изображения)
 components/SlideView    — рендер слайда 1080×1350 (4 макета)
 components/App          — редактор
 lib/presets             — шрифты, палитры, стили изображений

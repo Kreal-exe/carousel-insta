@@ -17,8 +17,9 @@ import {
   pickPalette,
 } from "@/lib/presets";
 import { buildImagePrompt } from "@/lib/imagePrompt";
+import { generateCarousel, generateImage as requestImage } from "@/lib/openai";
 import { loadProject, loadSettings, saveProject, saveSettings } from "@/lib/storage";
-import type { Brief, Design, GeneratedCarousel, LayoutId, Project, Settings, Slide, SlideKind } from "@/lib/types";
+import type { Brief, Design, LayoutId, Project, Settings, Slide, SlideKind } from "@/lib/types";
 import { SLIDE_H, SLIDE_W } from "@/lib/types";
 import { ScaledSlide, SlideView, resolveLayout } from "./SlideView";
 
@@ -34,17 +35,6 @@ const EMPTY_PROJECT: Project = {
 
 function newSlide(kind: SlideKind = "content"): Slide {
   return { id: uid(), kind, eyebrow: "", title: "Новый слайд", body: "", imagePrompt: "", imageStatus: "idle" };
-}
-
-async function postJson<T>(url: string, body: unknown, apiKey: string): Promise<T> {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", ...(apiKey ? { "x-openai-key": apiKey } : {}) },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-  return data as T;
 }
 
 function download(url: string, name: string) {
@@ -115,10 +105,11 @@ export default function App() {
       if (!slide) return;
       updateSlide(id, { imageStatus: "loading", imageError: undefined });
       try {
-        const { image } = await postJson<{ image: string }>(
-          "/api/generate-image",
-          { prompt: fullPrompt(slide, design), model: settings.imageModel, quality: settings.imageQuality },
+        const image = await requestImage(
+          fullPrompt(slide, design),
           settings.apiKey,
+          settings.imageModel,
+          settings.imageQuality,
         );
         updateSlide(id, { image, imageStatus: "done" });
       } catch (e) {
@@ -149,13 +140,14 @@ export default function App() {
       setToast({ kind: "error", text: "Сначала напишите тему карусели" });
       return;
     }
+    if (!settings.apiKey.trim()) {
+      setShowSettings(true);
+      setToast({ kind: "error", text: "Вставьте API-ключ OpenAI, чтобы генерировать карусели" });
+      return;
+    }
     setBusyText(true);
     try {
-      const data = await postJson<GeneratedCarousel>(
-        "/api/generate-text",
-        { brief: project.brief, model: settings.textModel },
-        settings.apiKey,
-      );
+      const data = await generateCarousel(project.brief, settings.apiKey, settings.textModel);
       const slides: Slide[] = data.slides.map((s) => ({ ...s, id: uid(), imageStatus: "idle" }));
       const next = { ...projectRef.current, slides, caption: data.caption, hashtags: data.hashtags };
       projectRef.current = next;
@@ -817,13 +809,16 @@ export default function App() {
                 API-ключ
                 <input
                   type="password"
-                  placeholder="sk-… (если не задан OPENAI_API_KEY на сервере)"
+                  placeholder="sk-…"
                   value={settings.apiKey}
                   onChange={(e) => updateSettings({ apiKey: e.target.value })}
                 />
               </label>
               <p className="hint">
-                Ключ хранится только в этом браузере и передаётся на ваш сервер приложения для запросов к OpenAI.
+                Ключ хранится только в этом браузере и отправляется напрямую в OpenAI. Создать ключ:{" "}
+                <a href="https://platform.openai.com/api-keys" target="_blank" rel="noreferrer">
+                  platform.openai.com/api-keys
+                </a>
               </p>
               <label>
                 Модель для текста
