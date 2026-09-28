@@ -1,43 +1,26 @@
 "use client";
 
-// Режим «через ChatGPT»: без API-ключа, на обычной подписке ChatGPT.
-// Приложение готовит задание → пользователь открывает его в chatgpt.com →
-// вставляет ответ обратно (тексты) и перетаскивает скачанные картинки.
+// Работа через обычный ChatGPT (по подписке, без API-ключа): приложение готовит задание,
+// открывает chatgpt.com, а результат пользователь вставляет обратно (текст) или перетаскивает (картинки).
 
-import type { Brief, GeneratedCarousel, SlideKind } from "./types";
-import { SYSTEM_PROMPT, briefPrompt, titleVariantsTask } from "./openai";
+import { WRITING_RULES, carouselRequest } from "./openai";
 
-const JSON_SHAPE = `{
-  "slides": [
-    { "kind": "cover", "eyebrow": "…", "title": "…", "body": "…", "imagePrompt": "…" },
-    { "kind": "content", "eyebrow": "…", "title": "…", "body": "…", "imagePrompt": "…" },
-    { "kind": "cta", "eyebrow": "…", "title": "…", "body": "…", "imagePrompt": "…" }
-  ],
-  "caption": "…",
-  "hashtags": ["…", "…"]
-}`;
+/** Задание на тексты: ответ приходит в формате поля «Одним текстом» */
+export function textTaskPrompt(topic: string, count: number): string {
+  return `${WRITING_RULES}
 
-/** Полное задание для ChatGPT: правила + бриф + строгий формат ответа */
-export function carouselTaskPrompt(brief: Brief): string {
-  return `${SYSTEM_PROMPT}
+${carouselRequest(topic, count)}
 
-ЗАДАНИЕ
-${briefPrompt(brief)}
-
-ФОРМАТ ОТВЕТА
-Ответь ОДНИМ блоком кода \`\`\`json без пояснений до и после. Структура:
-${JSON_SHAPE}
-Не генерируй изображения на этом шаге — только JSON.`;
-}
-
-export function titleVariantsPrompt(...args: Parameters<typeof titleVariantsTask>): string {
-  return `${SYSTEM_PROMPT}\n\n${titleVariantsTask(...args)}\n\nОтветь нумерованным списком из 5 вариантов, без пояснений.`;
+ФОРМАТ ОТВЕТА — только текст слайдов, без пояснений и без «Слайд 1»:
+- слайды разделяй отдельной строкой ===
+- первый абзац слайда — заголовок, затем пустая строка и текст слайда
+- ключевые слова выделяй **так**`;
 }
 
 /** Одно задание на всю серию картинок, чтобы они получились в едином стиле */
 export function imagesTaskPrompt(prompts: string[]): string {
   const list = prompts.map((p, i) => `${i + 1}. ${p}`).join("\n\n");
-  return `Сгенерируй серию из ${prompts.length} изображений для слайдов Instagram-карусели. Каждое — ВЕРТИКАЛЬНОЕ (портрет 4:5 или 2:3), без какого-либо текста, букв и логотипов. Все изображения должны выглядеть как одна серия: одинаковый стиль, свет и цветовая гамма.
+  return `Сгенерируй серию из ${prompts.length} изображений для слайдов Instagram-карусели. Каждое — ВЕРТИКАЛЬНОЕ (портрет 4:5 или 2:3), без какого-либо текста, букв и логотипов. Все изображения — одна серия: одинаковый стиль, свет и цветовая гамма.
 
 Делай строго по порядку, по одному изображению на пункт. Если все сразу не получается — сделай первое и продолжай, когда я напишу «дальше».
 
@@ -59,66 +42,6 @@ export async function openInChatGPT(prompt: string): Promise<"prefilled" | "clip
   window.open(tooLong && copied ? "https://chatgpt.com/" : url, "_blank", "noopener");
   return tooLong && copied ? "clipboard" : "prefilled";
 }
-
-const KINDS: SlideKind[] = ["cover", "content", "cta"];
-
-/** Разбирает ответ ChatGPT: достаёт JSON из блока кода или из текста и мягко чинит поля */
-export function parseCarouselAnswer(text: string): GeneratedCarousel {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
-  let raw = fenced ?? text;
-  const start = raw.indexOf("{");
-  const end = raw.lastIndexOf("}");
-  if (start < 0 || end <= start) {
-    throw new Error("В ответе не найден JSON. Скопируйте ответ ChatGPT целиком (кнопка «Копировать» под сообщением).");
-  }
-  raw = raw.slice(start, end + 1);
-
-  // Пробуем как есть, затем чиним типичные поломки: висячие запятые и «умные» кавычки вместо обычных
-  const attempts = [
-    raw,
-    raw.replace(/,\s*([}\]])/g, "$1"),
-    raw.replace(/[“”]/g, '"').replace(/,\s*([}\]])/g, "$1"),
-  ];
-  let data: { slides?: unknown; caption?: unknown; hashtags?: unknown } | null = null;
-  for (const attempt of attempts) {
-    try {
-      data = JSON.parse(attempt);
-      break;
-    } catch {
-      // следующая попытка
-    }
-  }
-  if (!data) {
-    throw new Error("Не удалось прочитать JSON из ответа. Попросите ChatGPT: «Верни только JSON одним блоком кода».");
-  }
-  const slides = (Array.isArray(data.slides) ? data.slides : []) as Array<Record<string, unknown>>;
-  if (slides.length < 2) throw new Error("В ответе нет слайдов — проверьте, что скопировали весь ответ.");
-
-  const str = (v: unknown) => (typeof v === "string" ? v : "");
-  return {
-    slides: slides.map((s, i) => {
-      const kind = KINDS.includes(s.kind as SlideKind)
-        ? (s.kind as SlideKind)
-        : i === 0
-          ? "cover"
-          : i === slides.length - 1
-            ? "cta"
-            : "content";
-      return {
-        kind,
-        eyebrow: str(s.eyebrow),
-        title: str(s.title),
-        body: str(s.body),
-        imagePrompt: str(s.imagePrompt ?? s.image_prompt),
-      };
-    }),
-    caption: str(data.caption),
-    hashtags: (Array.isArray(data.hashtags) ? data.hashtags : [])
-      .map((h) => String(h).replace(/^#/, "").replace(/\s+/g, ""))
-      .filter(Boolean),
-  };
-}
-
 /** Время из имени файла ChatGPT («ChatGPT Image …, 02_52_10 PM.png») в секундах, если оно есть */
 function timeFromName(name: string): number | null {
   const m = name.match(/(\d{1,2})[_.:](\d{2})[_.:](\d{2})\s*([AP]M)?/i);

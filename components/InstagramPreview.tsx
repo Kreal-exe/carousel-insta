@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { Project } from "@/lib/types";
-import { SLIDE_W } from "@/lib/types";
+import { SLIDE_W, toneOf } from "@/lib/types";
 import { ScaledSlide, SlideView } from "./SlideView";
 
 // Сетка профиля показывает пост в 3:4 — от 4:5 обрезаются края по ширине
@@ -37,7 +37,7 @@ export function InstagramPreview({ project, onClose }: { project: Project; onClo
     <div className="modal-bg" onClick={onClose}>
       <div className="ig" style={{ width: W }} onClick={(e) => e.stopPropagation()}>
         <div className="ig-head">
-          <span className="ig-avatar" style={{ background: design.accent, color: design.bg }}>
+          <span className="ig-avatar" style={{ background: design.dark.accent, color: design.dark.bg2 }}>
             {handle[0]?.toUpperCase()}
           </span>
           <b>{handle}</b>
@@ -59,7 +59,7 @@ export function InstagramPreview({ project, onClose }: { project: Project; onClo
             {slides.map((s, n) => (
               <div key={s.id} style={{ flex: `0 0 ${W}px` }}>
                 <ScaledSlide width={W}>
-                  <SlideView slide={s} index={n} total={slides.length} design={design} />
+                  <SlideView slide={s} index={n} total={slides.length} tone={toneOf(slides, n, design)} design={design} />
                 </ScaledSlide>
               </div>
             ))}
@@ -105,9 +105,6 @@ export function InstagramPreview({ project, onClose }: { project: Project; onClo
             <button className="ig-more" onClick={() => setMore(true)}>
               ещё
             </button>
-          )}
-          {!cut && project.hashtags.length > 0 && (
-            <div className="ig-tags">{project.hashtags.map((h) => `#${h}`).join(" ")}</div>
           )}
         </div>
 

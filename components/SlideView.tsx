@@ -2,37 +2,38 @@
 
 import { forwardRef, useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { fontCss } from "@/lib/presets";
-import type { Design, LayoutId, Slide } from "@/lib/types";
+import { parseSlide, type Block } from "@/lib/text";
+import type { Design, Slide, Tone } from "@/lib/types";
 import { SLIDE_H, SLIDE_W } from "@/lib/types";
 
-export function resolveLayout(slide: Slide, design: Design): LayoutId {
-  if (slide.layout) return slide.layout;
-  if (slide.kind === "cover") return design.coverLayout;
-  if (slide.kind === "cta") return design.ctaLayout;
-  return design.layout;
-}
+// Предлоги, союзы и частицы, которые не должны оставаться в конце строки
+const SHORT_WORDS =
+  /(?<=^|[\s(«"])(в|во|к|ко|с|со|у|о|об|от|до|за|из|на|по|не|ни|и|а|но|да|или|для|без|при|про|над|под|что|как)\s+/gi;
 
-/** Типографика: короткие слова (предлоги, союзы) не остаются висеть в конце строки */
+/** Типографика: предлоги и союзы не висят в конце строки, числа не отрываются от слова */
 function typograph(text: string): string {
   return text
-    .replace(/(?<=^|[\s(«"])([а-яёa-z]{1,2})\s+/gi, "$1\u00A0")
-    .replace(/\s+([—–])\s/g, "\u00A0$1 ")
-    .replace(/(\d+)\s+(?=[^\s\d])/g, "$1\u00A0");
+    .replace(SHORT_WORDS, "$1\u00A0")
+    .replace(/\s+([—–])\s/g, " $1 ")
+    .replace(/(\d+)\s+(?=[^\s\d])/g, "$1 ");
 }
 
-/** **слово** → выделение */
+/** **слова** → акцент */
 function rich(raw: string): ReactNode[] {
-  const text = typograph(raw);
-  return text.split(/(\*\*[^*]+\*\*)/g).map((part, i) =>
-    part.startsWith("**") && part.endsWith("**") ? (
-      <span key={i} className="hl">
-        {part.slice(2, -2)}
-      </span>
-    ) : (
-      part
-    ),
-  );
+  return typograph(raw)
+    .split(/(\*\*[^*]+\*\*)/g)
+    .map((part, i) =>
+      part.startsWith("**") && part.endsWith("**") ? (
+        <span key={i} className="hl">
+          {part.slice(2, -2)}
+        </span>
+      ) : (
+        part
+      ),
+    );
 }
+
+const plainLen = (s: string) => s.replace(/\*\*/g, "").length;
 
 function hexToRgba(hex: string, alpha: number): string {
   const h = hex.replace("#", "");
@@ -41,32 +42,64 @@ function hexToRgba(hex: string, alpha: number): string {
   return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
 }
 
-function titleSize(slide: Slide, layout: LayoutId, scale: number): number {
-  const plain = slide.title.replace(/\*\*/g, "");
-  let base = slide.kind === "cover" ? 112 : 84;
-  if (layout === "split" || layout === "frame") base *= 0.82;
-  const len = plain.length;
-  const k = len > 90 ? 0.6 : len > 65 ? 0.7 : len > 45 ? 0.82 : len > 28 ? 0.92 : 1;
-  return Math.round(base * k * scale);
+function renderBlock(b: Block, i: number) {
+  switch (b.t) {
+    case "h":
+      return (
+        <h2 key={i} className="s-h">
+          {rich(b.text)}
+        </h2>
+      );
+    case "p":
+      return (
+        <p key={i} className="s-p">
+          {rich(b.text)}
+        </p>
+      );
+    case "hr":
+      return <div key={i} className="s-hr" style={{ width: 120, height: 2 }} />;
+    case "quote":
+      return (
+        <div key={i} className="s-quote">
+          {b.lines.map((l, j) => (
+            <p key={j}>{rich(l)}</p>
+          ))}
+        </div>
+      );
+    case "box":
+      return (
+        <div key={i} className="s-box">
+          {b.items.map((it, j) => (
+            <p key={j} className={it.big ? "s-box-big" : "s-box-small"}>
+              {rich(it.text)}
+            </p>
+          ))}
+        </div>
+      );
+  }
 }
 
 interface Props {
   slide: Slide;
   index: number;
   total: number;
+  tone: Tone;
   design: Design;
+  /** Показывать подсказки в пустом слайде (только в редакторе, не в экспорте) */
+  hints?: boolean;
 }
 
 export const SlideView = forwardRef<HTMLDivElement, Props>(function SlideView(
-  { slide, index, total, design },
+  { slide, index, total, tone, design, hints },
   ref,
 ) {
-  const layout = resolveLayout(slide, design);
-  const isLast = index === total - 1;
+  const photo = Boolean(slide.image);
+  const isLast = index === total - 1 && total > 1;
+  const blocks = parseSlide(slide.text);
+  const pal = design[tone];
 
-  // Автоподгонка: если текст не влезает в свою зону, уменьшаем кегль ступенями по 8%
+  // Автоподгонка: если текст не помещается в свою зону — уменьшаем кегль ступенями
   const [fit, setFit] = useState(1);
-  const [numClash, setNumClash] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const setRefs = useCallback(
     (el: HTMLDivElement | null) => {
@@ -76,156 +109,103 @@ export const SlideView = forwardRef<HTMLDivElement, Props>(function SlideView(
     },
     [ref],
   );
-  const fitKey = [
-    slide.title, slide.body, slide.eyebrow, slide.kind, layout, design.titleScale,
-    design.headingFont, design.bodyFont, design.uppercaseTitles, design.align, design.showCounter,
-  ].join("|");
+  const fitKey = [slide.text, photo, design.titleScale, design.bodyScale, design.headingFont, design.bodyFont, design.coverFont, design.coverUppercase].join("|");
   useLayoutEffect(() => setFit(1), [fitKey]);
   useEffect(() => {
     document.fonts?.ready.then(() => setFit(1));
   }, []);
   useLayoutEffect(() => {
-    const root = rootRef.current;
-    const text = root?.querySelector<HTMLElement>(".s-text");
-    if (!root || !text) return;
-    const top = text.offsetTop;
-    const bottom = top + text.offsetHeight;
-    const frameImg = root.querySelector<HTMLElement>(".s-frame-img");
-    const overflow = top < 150 || bottom > SLIDE_H - 120 || (frameImg !== null && frameImg.offsetHeight < 420);
-    if (overflow && fit > 0.5) setFit((f) => Math.round(f * 0.92 * 100) / 100);
-    // крупная декоративная цифра не должна залезать под заголовок
-    const clash = top < 330;
-    if (clash !== numClash) setNumClash(clash);
+    const zone = rootRef.current?.querySelector<HTMLElement>(".s-zone");
+    const content = zone?.firstElementChild as HTMLElement | null;
+    if (!zone || !content) return;
+    if (content.offsetHeight > zone.offsetHeight && fit > 0.45) setFit((f) => Math.round(f * 0.92 * 100) / 100);
   });
 
-  const tSize = Math.round(titleSize(slide, layout, design.titleScale) * fit);
-  const bodySize = Math.round((slide.kind === "cover" ? 38 : layout === "minimal" ? 40 : 36) * Math.max(fit, 0.75));
+  // Размер заголовка зависит от длины текста
+  const hLen = blocks.filter((b) => b.t === "h").reduce((a, b) => a + plainLen((b as { text: string }).text), 0);
+  const hBase = photo
+    ? hLen > 70 ? 76 : hLen > 45 ? 88 : 100
+    : hLen > 150 ? 58 : hLen > 90 ? 66 : 76;
+  const pBase = photo ? 68 : 40;
 
   const style = {
     width: SLIDE_W,
     height: SLIDE_H,
-    "--bg": design.bg,
-    "--surface": design.surface,
-    "--text": design.text,
-    "--muted": design.muted,
-    "--accent": design.accent,
+    "--bg1": pal.bg1,
+    "--bg2": pal.bg2,
+    "--text": pal.text,
+    "--muted": pal.muted,
+    "--accent": pal.accent,
+    "--line": hexToRgba(pal.accent, 0.55),
+    "--box": tone === "dark" ? "rgba(255,255,255,0.075)" : "rgba(60,40,20,0.06)",
     "--heading": fontCss(design.headingFont),
     "--body": fontCss(design.bodyFont),
-    "--title-size": `${tSize}px`,
-    "--body-size": `${bodySize}px`,
-    "--align": design.align,
+    "--cover": fontCss(design.coverFont),
+    "--h-size": `${Math.round(hBase * design.titleScale * fit)}px`,
+    "--p-size": `${Math.round(pBase * design.bodyScale * Math.max(fit, 0.7))}px`,
+    // для фото — светлые тона тёмной палитры
+    "--cover-sub": design.dark.text,
+    "--cover-accent": design.dark.accent,
   } as CSSProperties;
 
-  const image = slide.image ? (
-    <img
-      className="s-img"
-      src={slide.image}
-      alt=""
-      style={{ width: "100%", height: "100%", objectPosition: `50% ${slide.imageFocus ?? 50}%` }}
-    />
-  ) : (
-    <div className="s-img s-img--empty">
-      <span>{slide.imageStatus === "loading" ? "Генерирую изображение…" : "Нет изображения"}</span>
-    </div>
-  );
-
-  const text = (
-    <div className="s-text">
-      {layout === "minimal" && slide.kind === "content" && <div className="s-rule" style={{ width: 96, height: 8 }} />}
-      {slide.eyebrow && <div className="s-eyebrow">{slide.eyebrow}</div>}
-      {slide.title && <h2 className="s-title">{rich(slide.title)}</h2>}
-      {slide.body && <p className="s-body">{rich(slide.body)}</p>}
-    </div>
-  );
-
-  const bigNumber =
-    layout === "minimal" && slide.kind === "content" && !numClash ? (
-      <div className="s-bignum">{String(index).padStart(2, "0")}</div>
-    ) : null;
+  const empty = !slide.text.trim();
 
   return (
     <div
       ref={setRefs}
       className={[
         "slide",
-        `slide--${layout}`,
-        `slide--${slide.kind}`,
-        `hl--${design.highlight}`,
-        design.uppercaseTitles ? "slide--upper" : "",
+        photo ? "slide--photo" : `slide--${tone}`,
         design.align === "center" ? "slide--center" : "",
+        design.coverUppercase ? "slide--upper" : "",
       ].join(" ")}
       style={style}
     >
-      {layout === "overlay" && (
+      {photo ? (
         <>
-          {image}
+          <img
+            className="s-img"
+            src={slide.image}
+            alt=""
+            style={{ width: "100%", height: "100%", objectPosition: `50% ${slide.imageFocus ?? 30}%` }}
+          />
+          {design.haze && <div className="s-haze" />}
           <div
             className="s-shade"
             style={{
-              background: `linear-gradient(180deg, ${hexToRgba(design.bg, design.overlay * 0.35)} 0%, ${hexToRgba(
-                design.bg,
-                0,
-              )} 22%, ${hexToRgba(design.bg, design.overlay * 0.55)} 50%, ${hexToRgba(
-                design.bg,
-                Math.min(1, design.overlay * 1.3),
-              )} 100%)`,
+              background: `linear-gradient(180deg, rgba(0,0,0,0) 40%, rgba(14,10,8,${design.overlay * 0.55}) 68%, rgba(14,10,8,${design.overlay}) 100%)`,
             }}
           />
-          {text}
         </>
+      ) : (
+        <div className="s-bg" />
       )}
 
-      {layout === "split" && (
-        <>
-          <div className="s-split-img" style={{ height: 740 }}>{image}</div>
-          {text}
-        </>
-      )}
-
-      {layout === "frame" && (
-        <>
-          {text}
-          <div className="s-frame-img">{image}</div>
-        </>
-      )}
-
-      {layout === "minimal" && (
-        <>
-          {bigNumber}
-          {text}
-        </>
-      )}
-
-      <div className="s-top">
-        <span className="s-handle">{design.handle}</span>
-        {design.showCounter && (
-          <span className="s-counter">
-            {index + 1} / {total}
-          </span>
-        )}
+      <div className="s-zone">
+        <div className="s-content">
+          {empty && hints ? <p className="s-hint">Введите текст слайда слева</p> : blocks.map(renderBlock)}
+        </div>
       </div>
 
-      {design.showSwipe && !isLast && (
-        <div className="s-swipe">
-          листай
-          <svg width="44" height="20" viewBox="0 0 44 20" fill="none" aria-hidden>
-            <path d="M0 10h40M32 2l8 8-8 8" stroke="currentColor" strokeWidth="2.5" />
-          </svg>
+      {design.showCounter && !photo && (
+        <div className="s-counter">
+          {String(index + 1).padStart(2, "0")} / {String(total).padStart(2, "0")}
         </div>
       )}
-      {isLast && design.showSwipe && (
-        <div className="s-swipe s-swipe--save">
-          <svg width="26" height="30" viewBox="0 0 26 30" fill="none" aria-hidden>
-            <path d="M2 2h22v26l-11-8-11 8z" stroke="currentColor" strokeWidth="2.5" strokeLinejoin="round" />
+
+      <div className={`s-foot ${isLast ? "s-foot--center" : ""}`}>
+        <span className="s-handle">{design.handle}</span>
+        {design.showArrow && !isLast && (
+          <svg className="s-arrow" width="106" height="14" viewBox="0 0 106 14" fill="none" aria-hidden>
+            <path d="M0 7h104M97 1l7 6-7 6" stroke="currentColor" strokeWidth="1.6" />
           </svg>
-          сохрани
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 });
 
-/** Превью слайда, отмасштабированное под ширину контейнера */
+/** Превью слайда, отмасштабированное под заданную ширину */
 export function ScaledSlide({ width, children }: { width: number; children: ReactNode }) {
   const scale = width / SLIDE_W;
   return (

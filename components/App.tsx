@@ -1,53 +1,34 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import JSZip from "jszip";
 import { toPng } from "html-to-image";
-import {
-  DEFAULT_BRIEF,
-  DEFAULT_DESIGN,
-  DEFAULT_SETTINGS,
-  FONTS,
-  FORMATS,
-  GOALS,
-  THEMES,
-  IMAGE_STYLES,
-  LAYOUTS,
-  PALETTES,
-  TONES,
-  imageStylePrompt,
-  fontCss,
-  pickPalette,
-} from "@/lib/presets";
+import { DEFAULT_DESIGN, DEFAULT_SETTINGS, FONTS, IMAGE_STYLES, THEMES, imageStylePrompt } from "@/lib/presets";
 import { buildImagePrompt } from "@/lib/imagePrompt";
-import { generateCarousel, generateImage as requestImage, generateTitleVariants } from "@/lib/openai";
-import {
-  carouselTaskPrompt,
-  imagesTaskPrompt,
-  openInChatGPT,
-  parseCarouselAnswer,
-  sortImageFiles,
-  titleVariantsPrompt,
-} from "@/lib/chatgpt";
+import { generateCarousel, generateImage as requestImage } from "@/lib/openai";
+import { imagesTaskPrompt, openInChatGPT, sortImageFiles, textTaskPrompt } from "@/lib/chatgpt";
 import { loadProject, loadSettings, saveProject, saveSettings } from "@/lib/storage";
-import type { Brief, Design, GeneratedCarousel, LayoutId, Project, Settings, Slide, SlideKind } from "@/lib/types";
-import { SLIDE_H, SLIDE_W } from "@/lib/types";
-import { ScaledSlide, SlideView, resolveLayout } from "./SlideView";
+import {
+  SAMPLE_SLIDES,
+  autoSplit,
+  emptySlide,
+  paragraphsToSlides,
+  plainPreview,
+  slidesToText,
+  textToSlides,
+} from "@/lib/text";
+import type { Design, Palette, Project, Settings, Slide, Tone } from "@/lib/types";
+import { MAX_SLIDES, SLIDE_H, SLIDE_W, toneOf } from "@/lib/types";
+import { ScaledSlide, SlideView } from "./SlideView";
 import { InstagramPreview } from "./InstagramPreview";
 
-const uid = () => Math.random().toString(36).slice(2, 10);
-
-const EMPTY_PROJECT: Project = {
-  brief: DEFAULT_BRIEF,
+const newProject = (): Project => ({
+  // последний слайд примера — тёмный, как в референсе
+  slides: SAMPLE_SLIDES.map((t, i) => (i === SAMPLE_SLIDES.length - 1 ? { ...emptySlide(t), tone: "dark" as const } : emptySlide(t))),
   design: DEFAULT_DESIGN,
-  slides: [],
   caption: "",
-  hashtags: [],
-};
-
-function newSlide(kind: SlideKind = "content"): Slide {
-  return { id: uid(), kind, eyebrow: "", title: "Новый слайд", body: "", imagePrompt: "", imageStatus: "idle" };
-}
+  topic: "",
+});
 
 function download(url: string, name: string) {
   const a = document.createElement("a");
@@ -56,36 +37,89 @@ function download(url: string, name: string) {
   a.click();
 }
 
+type Edit = { value: string; start: number; end: number };
+
+/** Добавляет или убирает префикс у выделенных строк */
+function prefixLines({ value, start, end }: Edit, prefix: string): Edit {
+  const from = value.lastIndexOf("\n", start - 1) + 1;
+  const toIdx = value.indexOf("\n", Math.max(end - 1, start));
+  const to = toIdx === -1 ? value.length : toIdx;
+  const lines = value.slice(from, to).split("\n");
+  const all = lines.every((l) => l.startsWith(prefix));
+  const changed = lines.map((l) => (all ? l.slice(prefix.length) : l.startsWith(prefix) ? l : prefix + l)).join("\n");
+  return { value: value.slice(0, from) + changed + value.slice(to), start: from, end: from + changed.length };
+}
+
+/** Кнопки разметки над полем текста */
+const MARKUP: Array<{ id: string; label: string; title: string; apply: (e: Edit) => Edit }> = [
+  {
+    id: "accent",
+    label: "Акцент",
+    title: "Выделить: в заголовке — цветом, в тексте — жирным (**слова**)",
+    apply: ({ value, start, end }) => {
+      const sel = value.slice(start, end);
+      if (sel.length >= 4 && sel.startsWith("**") && sel.endsWith("**")) {
+        const inner = sel.slice(2, -2);
+        return { value: value.slice(0, start) + inner + value.slice(end), start, end: start + inner.length };
+      }
+      return { value: value.slice(0, start) + "**" + sel + "**" + value.slice(end), start: start + 2, end: end + 2 };
+    },
+  },
+  { id: "h", label: "Заголовок", title: "Сделать строку крупным заголовком (# в начале строки)", apply: (e) => prefixLines(e, "# ") },
+  {
+    id: "hr",
+    label: "Линия",
+    title: "Тонкая линия-разделитель (---)",
+    apply: ({ value, end }) => {
+      const nl = value.indexOf("\n", end);
+      const lineEnd = nl === -1 ? value.length : nl;
+      const next = value.slice(0, lineEnd) + "\n---\n" + value.slice(lineEnd);
+      return { value: next, start: lineEnd + 5, end: lineEnd + 5 };
+    },
+  },
+  { id: "box", label: "Плашка", title: "Текст на плашке (! в начале строки; «! #» — крупно)", apply: (e) => prefixLines(e, "! ") },
+  { id: "quote", label: "Цитата", title: "Цитата с вертикальной линией (> в начале строки)", apply: (e) => prefixLines(e, "> ") },
+];
+
 export default function App() {
-  const [project, setProject] = useState<Project>(EMPTY_PROJECT);
+  const [project, setProject] = useState<Project>(newProject);
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [loaded, setLoaded] = useState(false);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [tab, setTab] = useState<"brief" | "design" | "caption">("brief");
-  const [busyText, setBusyText] = useState(false);
+  const [activeId, setActiveId] = useState<string>("");
+  const [mode, setMode] = useState<"slides" | "text">("slides");
+  const [bigText, setBigText] = useState("");
+  const [splitCount, setSplitCount] = useState(8);
+  const [tab, setTab] = useState<"style" | "colors">("style");
   const [exporting, setExporting] = useState(false);
-  const [autoImages, setAutoImages] = useState(true);
-  const [chatAnswer, setChatAnswer] = useState("");
-  const [dragOver, setDragOver] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
+  const [busy, setBusy] = useState(false);
   const [showPreview, setShowPreview] = useState(false);
-  const [variants, setVariants] = useState<{ slideId: string; titles: string[]; loading: boolean } | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
   const [toast, setToast] = useState<{ kind: "error" | "info"; text: string } | null>(null);
-  const slideRefs = useRef(new Map<string, HTMLDivElement>());
+  const [stageW, setStageW] = useState(480);
+
+  const thumbRefs = useRef(new Map<string, HTMLDivElement>());
+  const areaRefs = useRef(new Map<string, HTMLTextAreaElement>());
+  const cardRefs = useRef(new Map<string, HTMLDivElement>());
+  const stageRef = useRef<HTMLDivElement>(null);
   const projectRef = useRef(project);
   projectRef.current = project;
 
+  const { slides, design } = project;
+  const activeIndex = Math.max(0, slides.findIndex((s) => s.id === activeId));
+  const active = slides[activeIndex];
+
   // --- загрузка / сохранение ---
   useEffect(() => {
-    const stored = loadSettings();
-    // у тех, кто уже ввёл ключ до появления режимов, оставляем автоматический режим
-    setSettings({ ...DEFAULT_SETTINGS, mode: stored.apiKey ? "api" : "chatgpt", ...stored });
+    setSettings({ ...DEFAULT_SETTINGS, ...loadSettings() });
     loadProject().then((p) => {
-      if (p) {
-        // незавершённые генерации после перезагрузки сбрасываем
-        const slides = p.slides.map((s) => (s.imageStatus === "loading" ? { ...s, imageStatus: "idle" as const } : s));
-        setProject({ ...EMPTY_PROJECT, ...p, brief: { ...DEFAULT_BRIEF, ...p.brief }, design: { ...DEFAULT_DESIGN, ...p.design }, slides });
-        setSelectedId(slides[0]?.id ?? null);
+      const valid =
+        p && Array.isArray(p.slides) && p.slides.length > 0 && p.slides.every((s) => typeof s.text === "string") && p.design?.light;
+      if (valid) {
+        const restored = p.slides.map((s) => (s.imageStatus === "loading" ? { ...s, imageStatus: undefined } : s));
+        setProject({ ...newProject(), ...p, design: { ...DEFAULT_DESIGN, ...p.design }, slides: restored });
+        setActiveId(restored[0].id);
+      } else {
+        setActiveId(projectRef.current.slides[0].id);
       }
       setLoaded(true);
     });
@@ -99,212 +133,213 @@ export default function App() {
 
   useEffect(() => {
     if (!toast) return;
-    const t = setTimeout(() => setToast(null), toast.kind === "error" ? 9000 : 3000);
+    const t = setTimeout(() => setToast(null), toast.kind === "error" ? 9000 : 4000);
     return () => clearTimeout(t);
   }, [toast]);
 
-  // --- обновления состояния ---
-  const setBrief = (patch: Partial<Brief>) => setProject((p) => ({ ...p, brief: { ...p.brief, ...patch } }));
-  const setDesign = (patch: Partial<Design>) => setProject((p) => ({ ...p, design: { ...p.design, ...patch } }));
+  // большое превью занимает всё свободное место
+  useLayoutEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      const r = el.getBoundingClientRect();
+      const byHeight = ((r.height - 8) * SLIDE_W) / SLIDE_H;
+      setStageW(Math.round(Math.max(240, Math.min(r.width - 96, byHeight, 640))));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // --- изменения ---
+  const setSlides = useCallback((fn: (s: Slide[]) => Slide[]) => setProject((p) => ({ ...p, slides: fn(p.slides) })), []);
   const updateSlide = useCallback(
-    (id: string, patch: Partial<Slide>) =>
-      setProject((p) => ({ ...p, slides: p.slides.map((s) => (s.id === id ? { ...s, ...patch } : s)) })),
-    [],
+    (id: string, patch: Partial<Slide>) => setSlides((all) => all.map((s) => (s.id === id ? { ...s, ...patch } : s))),
+    [setSlides],
   );
+  const setDesign = (patch: Partial<Design>) => setProject((p) => ({ ...p, design: { ...p.design, ...patch } }));
+  const setPalette = (tone: Tone, patch: Partial<Palette>) =>
+    setProject((p) => ({ ...p, design: { ...p.design, [tone]: { ...p.design[tone], ...patch } } }));
 
-  const fullPrompt = (slide: Slide, design: Design) =>
-    buildImagePrompt(slide.imagePrompt || slide.title.replace(/\*\*/g, ""), imageStylePrompt(design), resolveLayout(slide, design));
-
-  // --- генерация ---
-  const generateImage = useCallback(
-    async (id: string) => {
-      const { slides, design } = projectRef.current;
-      const slide = slides.find((s) => s.id === id);
-      if (!slide) return;
-      updateSlide(id, { imageStatus: "loading", imageError: undefined });
-      try {
-        const image = await requestImage(
-          fullPrompt(slide, design),
-          settings.apiKey,
-          settings.imageModel,
-          settings.imageQuality,
-        );
-        updateSlide(id, { image, imageStatus: "done" });
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        updateSlide(id, { imageStatus: "error", imageError: msg });
-        setToast({ kind: "error", text: msg });
-      }
-    },
-    [settings, updateSlide],
-  );
-
-  const generateImages = useCallback(
-    async (ids: string[]) => {
-      // не больше 3 параллельных запросов — щадим rate limit
-      const queue = [...ids];
-      const worker = async () => {
-        while (queue.length) await generateImage(queue.shift()!);
-      };
-      await Promise.all(Array.from({ length: Math.min(3, queue.length) }, worker));
-    },
-    [generateImage],
-  );
-
-  const needsImage = (s: Slide, d: Design) => resolveLayout(s, d) !== "minimal";
-
-  async function generateText() {
-    if (!project.brief.topic.trim()) {
-      setToast({ kind: "error", text: "Сначала напишите тему карусели" });
-      return;
-    }
-    if (!settings.apiKey.trim()) {
-      setShowSettings(true);
-      setToast({ kind: "error", text: "Вставьте API-ключ OpenAI или переключитесь на режим «Через ChatGPT»" });
-      return;
-    }
-    setBusyText(true);
-    try {
-      const data = await generateCarousel(project.brief, settings.apiKey, settings.textModel);
-      const slides = applyCarousel(data);
-      if (autoImages) generateImages(slides.filter((s) => needsImage(s, projectRef.current.design)).map((s) => s.id));
-    } catch (e) {
-      setToast({ kind: "error", text: e instanceof Error ? e.message : String(e) });
-    } finally {
-      setBusyText(false);
-    }
+  function select(id: string, scrollEditor = true) {
+    setActiveId(id);
+    if (scrollEditor) cardRefs.current.get(id)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
   }
 
-  function applyCarousel(data: GeneratedCarousel): Slide[] {
-    const slides: Slide[] = data.slides.map((s) => ({ ...s, id: uid(), imageStatus: "idle" }));
-    const next = { ...projectRef.current, slides, caption: data.caption, hashtags: data.hashtags };
-    projectRef.current = next;
-    setProject(next);
-    setSelectedId(slides[0]?.id ?? null);
-    return slides;
+  function applyMarkup(id: string, op: (e: Edit) => Edit) {
+    const el = areaRefs.current.get(id);
+    const slide = projectRef.current.slides.find((s) => s.id === id);
+    if (!slide) return;
+    const len = slide.text.length;
+    const res = op({ value: slide.text, start: el?.selectionStart ?? len, end: el?.selectionEnd ?? len });
+    updateSlide(id, { text: res.value });
+    requestAnimationFrame(() => {
+      el?.focus();
+      el?.setSelectionRange(res.start, res.end);
+    });
   }
 
-  // --- режим «через ChatGPT» ---
+  function addSlide() {
+    if (slides.length >= MAX_SLIDES) {
+      setToast({ kind: "error", text: `В Instagram максимум ${MAX_SLIDES} слайдов` });
+      return;
+    }
+    const s = emptySlide();
+    setSlides((all) => {
+      const next = [...all];
+      next.splice(activeIndex + 1, 0, s);
+      return next;
+    });
+    setActiveId(s.id);
+    if (mode === "slides") requestAnimationFrame(() => areaRefs.current.get(s.id)?.focus());
+  }
+  function removeSlide(id: string) {
+    if (slides.length <= 1) return;
+    const i = slides.findIndex((s) => s.id === id);
+    setSlides((all) => all.filter((s) => s.id !== id));
+    if (id === active?.id) setActiveId((slides[i + 1] ?? slides[i - 1]).id);
+  }
+  function moveSlide(id: string, dir: -1 | 1) {
+    setSlides((all) => {
+      const i = all.findIndex((s) => s.id === id);
+      const j = i + dir;
+      if (j < 0 || j >= all.length) return all;
+      const next = [...all];
+      [next[i], next[j]] = [next[j], next[i]];
+      return next;
+    });
+  }
+  function cycleTone(s: Slide) {
+    const order: Array<Tone | undefined> = [undefined, "light", "dark"];
+    updateSlide(s.id, { tone: order[(order.indexOf(s.tone) + 1) % order.length] });
+  }
+  function setImage(id: string, file: File) {
+    if (!file.type.startsWith("image/")) return;
+    const reader = new FileReader();
+    reader.onload = () => updateSlide(id, { image: String(reader.result), imageStatus: undefined, imageError: undefined });
+    reader.readAsDataURL(file);
+  }
+  const dropImage = (id: string) => ({
+    onDragOver: (e: React.DragEvent) => e.preventDefault(),
+    onDrop: (e: React.DragEvent) => {
+      const f = e.dataTransfer.files[0];
+      if (!f) return;
+      e.preventDefault();
+      setImage(id, f);
+    },
+  });
+
+  // --- режим «одним текстом» ---
+  function switchMode(m: "slides" | "text") {
+    if (m === "text") setBigText(slidesToText(projectRef.current.slides));
+    setMode(m);
+  }
+  function onBigText(v: string) {
+    setBigText(v);
+    setSlides((prev) => {
+      const next = textToSlides(v, prev);
+      return next.length ? next : [emptySlide()];
+    });
+  }
+  function applySplit(next: Slide[]) {
+    if (!next.length) return;
+    setSlides(() => next);
+    setBigText(slidesToText(next));
+    setActiveId(next[0].id);
+    setToast({ kind: "info", text: `Готово: ${next.length} слайдов` });
+  }
+
+  // --- ChatGPT / API ---
   async function openChat(prompt: string, what: string) {
     const how = await openInChatGPT(prompt);
     setToast({
       kind: "info",
       text:
         how === "prefilled"
-          ? `${what}: ChatGPT открыт в новой вкладке. Задание также в буфере обмена — если поле пустое, вставьте его (Ctrl+V).`
-          : `${what}: задание скопировано — вставьте его в ChatGPT (Ctrl+V) и отправьте.`,
+          ? `${what}: ChatGPT открыт в новой вкладке. Задание также скопировано — если поле пустое, нажмите Ctrl+V.`
+          : `${what}: задание скопировано — вставьте его в ChatGPT (Ctrl+V).`,
     });
   }
-
-  function startChatGPT() {
-    if (!project.brief.topic.trim()) {
-      setToast({ kind: "error", text: "Сначала напишите тему карусели" });
+  async function pasteAnswer() {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!text.trim()) throw new Error("empty");
+      const prev = projectRef.current.slides;
+      applySplit(/^\s*={3,}\s*$/m.test(text) ? textToSlides(text, prev) : paragraphsToSlides(text, prev));
+      setMode("text");
+    } catch {
+      switchMode("text");
+      setToast({ kind: "info", text: "Вставьте ответ ChatGPT в большое поле (Ctrl+V)." });
+    }
+  }
+  async function generateWithApi() {
+    if (!project.topic.trim()) {
+      setToast({ kind: "error", text: "Напишите тему" });
       return;
     }
-    openChat(carouselTaskPrompt(project.brief), "Тексты");
-  }
-
-  function importChatAnswer() {
+    setBusy(true);
     try {
-      const slides = applyCarousel(parseCarouselAnswer(chatAnswer));
-      setChatAnswer("");
-      setToast({ kind: "info", text: `Готово: ${slides.length} слайдов. Теперь — картинки (кнопка над слайдами).` });
+      const res = await generateCarousel(project.topic, splitCount, settings.apiKey, settings.textModel);
+      const prev = projectRef.current.slides;
+      applySplit(res.slides.map((s, i) => ({ ...(prev[i] ?? emptySlide()), text: s.body ? `${s.title}\n\n${s.body}` : s.title })));
+      setProject((p) => ({ ...p, caption: res.caption }));
     } catch (e) {
       setToast({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy(false);
     }
   }
-
-  /** Слайды, которым нужны картинки: сначала пустые, а если все заполнены — все по порядку */
-  function imageTargets(): Slide[] {
-    const { slides: all, design: d } = projectRef.current;
-    const withImages = all.filter((s) => needsImage(s, d));
-    const empty = withImages.filter((s) => !s.image);
-    return empty.length ? empty : withImages;
-  }
-
-  function openImagesInChatGPT() {
-    const { design: d } = projectRef.current;
-    const targets = imageTargets();
-    if (!targets.length) {
-      setToast({ kind: "info", text: "В текущих макетах картинки не нужны — выберите макет с фото во вкладке «Дизайн»." });
-      return;
-    }
-    openChat(imagesTaskPrompt(targets.map((s) => fullPrompt(s, d))), `Картинки (${targets.length})`);
-  }
-
-  function bulkUpload(files: File[]) {
-    const images = sortImageFiles(files.filter((f) => f.type.startsWith("image/")));
-    const targets = imageTargets();
-    images.slice(0, targets.length).forEach((f, i) => uploadImage(targets[i].id, f));
-    const placed = Math.min(images.length, targets.length);
-    setToast({
-      kind: "info",
-      text:
-        `Картинок разложено по слайдам: ${placed}.` +
-        (images.length > targets.length ? ` Лишних: ${images.length - targets.length}.` : "") +
-        " Чтобы поменять картинку на слайде — перетащите файл прямо на него.",
-    });
-  }
-
-  async function suggestTitles(slide: Slide) {
-    if (settings.mode === "chatgpt") {
-      const { slides: all, brief: b } = projectRef.current;
-      openChat(titleVariantsPrompt(slide, all, b), "Варианты заголовка");
-      return;
-    }
-    if (!settings.apiKey.trim()) {
-      setShowSettings(true);
-      return;
-    }
-    setVariants({ slideId: slide.id, titles: [], loading: true });
+  const imagePromptFor = (s: Slide) =>
+    buildImagePrompt(
+      `Photo for an Instagram carousel slide about: "${plainPreview(s.text)}"`,
+      imageStylePrompt(design),
+      "overlay",
+    );
+  async function generatePhoto(id: string) {
+    const s = projectRef.current.slides.find((x) => x.id === id);
+    if (!s) return;
+    updateSlide(id, { imageStatus: "loading", imageError: undefined });
     try {
-      const { slides: all, brief: b } = projectRef.current;
-      const titles = await generateTitleVariants(slide, all, b, settings.apiKey, settings.textModel);
-      setVariants({ slideId: slide.id, titles, loading: false });
+      const image = await requestImage(imagePromptFor(s), settings.apiKey, settings.imageModel, settings.imageQuality);
+      updateSlide(id, { image, imageStatus: undefined });
     } catch (e) {
-      setVariants(null);
-      setToast({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+      const msg = e instanceof Error ? e.message : String(e);
+      updateSlide(id, { imageStatus: "error", imageError: msg });
+      setToast({ kind: "error", text: msg });
     }
   }
 
   // --- экспорт ---
   async function renderPng(id: string): Promise<string> {
-    const node = slideRefs.current.get(id);
+    const node = thumbRefs.current.get(id);
     if (!node) throw new Error("Слайд не найден");
     await document.fonts.ready;
-    // Не переносим в клон вычисленные width/height: иначе блок с текстом сохраняет высоту из превью,
-    // а в экспорте строки переносятся чуть иначе — появляются пустые полосы. Нужные размеры заданы inline.
+    // вычисленные width/height в клон не переносим — иначе блоки текста «замерзают» на размерах превью
     const includeStyleProperties = Array.from(getComputedStyle(document.documentElement)).filter(
       (p) => !["width", "height", "inline-size", "block-size"].includes(p),
     );
     const opts = { width: SLIDE_W, height: SLIDE_H, pixelRatio: 1, cacheBust: false, includeStyleProperties };
-    // первый прогон прогревает шрифты/картинки (известная особенность html-to-image)
-    await toPng(node, opts);
+    await toPng(node, opts); // прогрев шрифтов и картинок
     return toPng(node, opts);
   }
-
-  async function exportOne(id: string) {
+  async function exportOne() {
     setExporting(true);
     try {
-      const idx = project.slides.findIndex((s) => s.id === id);
-      download(await renderPng(id), `slide-${String(idx + 1).padStart(2, "0")}.png`);
+      download(await renderPng(active.id), `slide-${String(activeIndex + 1).padStart(2, "0")}.png`);
     } catch (e) {
       setToast({ kind: "error", text: `Экспорт не удался: ${e instanceof Error ? e.message : e}` });
     } finally {
       setExporting(false);
     }
   }
-
   async function exportAll() {
     setExporting(true);
     try {
       const zip = new JSZip();
-      for (const [i, s] of project.slides.entries()) {
+      for (const [i, s] of slides.entries()) {
         const url = await renderPng(s.id);
         zip.file(`slide-${String(i + 1).padStart(2, "0")}.png`, url.split(",")[1], { base64: true });
       }
-      const caption = [project.caption, "", project.hashtags.map((h) => `#${h}`).join(" ")].join("\n");
-      zip.file("caption.txt", caption);
+      if (project.caption.trim()) zip.file("caption.txt", project.caption);
       const blob = await zip.generateAsync({ type: "blob" });
       const url = URL.createObjectURL(blob);
       download(url, "carousel.zip");
@@ -316,58 +351,6 @@ export default function App() {
     }
   }
 
-  // --- операции со слайдами ---
-  function moveSlide(id: string, dir: -1 | 1) {
-    setProject((p) => {
-      const i = p.slides.findIndex((s) => s.id === id);
-      const j = i + dir;
-      if (i < 0 || j < 0 || j >= p.slides.length) return p;
-      const slides = [...p.slides];
-      [slides[i], slides[j]] = [slides[j], slides[i]];
-      return { ...p, slides };
-    });
-  }
-  function removeSlide(id: string) {
-    setProject((p) => ({ ...p, slides: p.slides.filter((s) => s.id !== id) }));
-    if (selectedId === id) setSelectedId(null);
-  }
-  function duplicateSlide(id: string) {
-    setProject((p) => {
-      const i = p.slides.findIndex((s) => s.id === id);
-      const copy = { ...p.slides[i], id: uid() };
-      const slides = [...p.slides];
-      slides.splice(i + 1, 0, copy);
-      return { ...p, slides };
-    });
-  }
-  function addSlide() {
-    const s = newSlide();
-    setProject((p) => {
-      const slides = [...p.slides];
-      const ctaIdx = slides.findIndex((x) => x.kind === "cta");
-      slides.splice(ctaIdx >= 0 ? ctaIdx : slides.length, 0, s);
-      return { ...p, slides };
-    });
-    setSelectedId(s.id);
-  }
-  function uploadImage(id: string, file: File) {
-    const reader = new FileReader();
-    reader.onload = () => updateSlide(id, { image: String(reader.result), imageStatus: "done", imageError: undefined });
-    reader.readAsDataURL(file);
-  }
-  async function copy(text: string, what: string) {
-    try {
-      await navigator.clipboard.writeText(text);
-      setToast({ kind: "info", text: `${what} скопирован` });
-    } catch {
-      setToast({ kind: "error", text: "Не удалось скопировать" });
-    }
-  }
-  function resetProject() {
-    if (!confirm("Начать новую карусель? Текущие слайды будут удалены.")) return;
-    setProject((p) => ({ ...EMPTY_PROJECT, design: p.design }));
-    setSelectedId(null);
-  }
   function updateSettings(patch: Partial<Settings>) {
     setSettings((s) => {
       const next = { ...s, ...patch };
@@ -375,12 +358,32 @@ export default function App() {
       return next;
     });
   }
+  function loadSample() {
+    if (!confirm("Заменить текст примером? Фото и оформление сохранятся.")) return;
+    const next = SAMPLE_SLIDES.map((t, i) => ({ ...(slides[i] ?? emptySlide()), text: t }));
+    setSlides(() => next);
+    setActiveId(next[0].id);
+    setBigText(slidesToText(next));
+  }
+  function clearAll() {
+    if (!confirm("Очистить все слайды?")) return;
+    const blank = Array.from({ length: 5 }, () => emptySlide());
+    setSlides(() => blank);
+    setActiveId(blank[0].id);
+    setBigText(slidesToText(blank));
+  }
 
-  const { brief, design, slides } = project;
-  const selected = slides.find((s) => s.id === selectedId) ?? null;
-  const selectedIndex = selected ? slides.indexOf(selected) : -1;
-  const loadingCount = slides.filter((s) => s.imageStatus === "loading").length;
-  const missingImages = slides.filter((s) => needsImage(s, design) && !s.image && s.imageStatus !== "loading");
+  const hasKey = Boolean(settings.apiKey.trim());
+  const toneLabel = (s: Slide, i: number) => {
+    if (s.image) return "фото";
+    const name = toneOf(slides, i, design) === "light" ? "светлый" : "тёмный";
+    return s.tone ? name : `${name} · авто`;
+  };
+  const fontOptions = FONTS.map((f) => (
+    <option key={f.id} value={f.id}>
+      {f.label}
+    </option>
+  ));
 
   return (
     <div className="app">
@@ -389,331 +392,377 @@ export default function App() {
           <span className="logo">▦</span> Carousel Studio
         </div>
         <div className="topbar-actions">
-          {loadingCount > 0 && <span className="pill pill--busy">Изображения: {loadingCount} в работе</span>}
-          {slides.length > 0 && (
-            <>
-              <button className="btn" onClick={() => setShowPreview(true)}>
-                ▶ Просмотр
-              </button>
-              <button className="btn btn--ghost" onClick={resetProject}>
-                Новая
-              </button>
-              <button className="btn btn--primary" disabled={exporting} onClick={exportAll}>
-                {exporting ? "Экспорт…" : "Скачать ZIP (PNG 1080×1350)"}
-              </button>
-            </>
-          )}
-          <button className="btn btn--icon" title="Настройки" onClick={() => setShowSettings(true)}>
+          <button className="btn" onClick={() => setShowPreview(true)}>
+            ▶ Как в Instagram
+          </button>
+          <button className="btn btn--primary" disabled={exporting} onClick={exportAll}>
+            {exporting ? "Экспорт…" : `Скачать все (${slides.length} PNG)`}
+          </button>
+          <button className="btn btn--icon" title="Настройки API" onClick={() => setShowSettings(true)}>
             ⚙
           </button>
         </div>
       </header>
 
       <div className="layout">
-        {/* ---------- Левая панель ---------- */}
+        {/* ================= Текст ================= */}
         <aside className="panel panel--left">
           <div className="tabs">
-            <button className={tab === "brief" ? "active" : ""} onClick={() => setTab("brief")}>
-              Контент
+            <button className={mode === "slides" ? "active" : ""} onClick={() => switchMode("slides")}>
+              По слайдам
             </button>
-            <button className={tab === "design" ? "active" : ""} onClick={() => setTab("design")}>
-              Дизайн
-            </button>
-            <button className={tab === "caption" ? "active" : ""} onClick={() => setTab("caption")}>
-              Подпись
+            <button className={mode === "text" ? "active" : ""} onClick={() => switchMode("text")}>
+              Одним текстом
             </button>
           </div>
 
-          {tab === "brief" && (
-            <div className="form">
-              <label>
-                Тема карусели *
-                <textarea
-                  rows={3}
-                  placeholder="Напр.: 7 привычек, которые крадут вашу энергию по утрам"
-                  value={brief.topic}
-                  onChange={(e) => setBrief({ topic: e.target.value })}
-                />
-              </label>
-              <label>
-                Для кого
-                <input
-                  placeholder="Напр.: фрилансеры 25–35, работают из дома"
-                  value={brief.audience}
-                  onChange={(e) => setBrief({ audience: e.target.value })}
-                />
-              </label>
-              <label>
-                Формат
-                <select value={brief.format} onChange={(e) => setBrief({ format: e.target.value })}>
-                  {FORMATS.map((f) => (
-                    <option key={f.id} value={f.id}>
-                      {f.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <div className="row">
-                <label>
-                  Цель
-                  <select value={brief.goal} onChange={(e) => setBrief({ goal: e.target.value })}>
-                    {GOALS.map((g) => (
-                      <option key={g}>{g}</option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-              <div className="row">
-                <label>
-                  Тон
-                  <select value={brief.tone} onChange={(e) => setBrief({ tone: e.target.value })}>
-                    {TONES.map((t) => (
-                      <option key={t}>{t}</option>
-                    ))}
-                  </select>
-                </label>
-                <label className="narrow">
-                  Слайдов
-                  <input
-                    type="number"
-                    min={3}
-                    max={20}
-                    value={brief.slideCount}
-                    onChange={(e) => setBrief({ slideCount: Number(e.target.value) })}
-                  />
-                </label>
-              </div>
-              <label>
-                Язык
-                <input value={brief.language} onChange={(e) => setBrief({ language: e.target.value })} />
-              </label>
-              <label>
-                Пожелания
-                <textarea
-                  rows={2}
-                  placeholder="Напр.: призыв — написать «ГАЙД» в директ; без англицизмов"
-                  value={brief.extra}
-                  onChange={(e) => setBrief({ extra: e.target.value })}
-                />
-              </label>
-              <div className="field-title">Как генерировать</div>
-              <div className="seg">
-                <button
-                  className={settings.mode === "chatgpt" ? "active" : ""}
-                  onClick={() => updateSettings({ mode: "chatgpt" })}
+          {mode === "slides" ? (
+            <div className="cards">
+              {slides.map((s, i) => (
+                <div
+                  key={s.id}
+                  ref={(el) => {
+                    if (el) cardRefs.current.set(s.id, el);
+                    else cardRefs.current.delete(s.id);
+                  }}
+                  className={`tcard ${s.id === active?.id ? "tcard--active" : ""}`}
+                  onClick={() => setActiveId(s.id)}
+                  {...dropImage(s.id)}
                 >
-                  Через ChatGPT
-                  <small>по подписке, без ключа</small>
-                </button>
-                <button className={settings.mode === "api" ? "active" : ""} onClick={() => updateSettings({ mode: "api" })}>
-                  Автоматически
-                  <small>API-ключ OpenAI</small>
-                </button>
-              </div>
+                  <div className="tcard-head">
+                    <span className="tcard-num">{String(i + 1).padStart(2, "0")}</span>
+                    <button className="chip" title="Фон: авто / светлый / тёмный" onClick={() => cycleTone(s)} disabled={!!s.image}>
+                      {toneLabel(s, i)}
+                    </button>
+                    <span className="grow" />
+                    <button className="icon" title="Выше" onClick={() => moveSlide(s.id, -1)} disabled={i === 0}>
+                      ↑
+                    </button>
+                    <button className="icon" title="Ниже" onClick={() => moveSlide(s.id, 1)} disabled={i === slides.length - 1}>
+                      ↓
+                    </button>
+                    <button className="icon" title="Удалить слайд" onClick={() => removeSlide(s.id)} disabled={slides.length <= 1}>
+                      ✕
+                    </button>
+                  </div>
 
-              {settings.mode === "chatgpt" ? (
-                <>
-                  <button className="btn btn--primary btn--wide" onClick={startChatGPT}>
-                    ① Открыть задание в ChatGPT
-                  </button>
-                  <label>
-                    ② Вставьте сюда ответ ChatGPT
-                    <textarea
-                      rows={4}
-                      placeholder="Скопируйте ответ целиком (кнопка «Копировать» под сообщением ChatGPT) и вставьте"
-                      value={chatAnswer}
-                      onChange={(e) => setChatAnswer(e.target.value)}
-                    />
-                  </label>
-                  <button className="btn btn--wide" disabled={!chatAnswer.trim()} onClick={importChatAnswer}>
-                    {slides.length ? "Заменить слайды ответом" : "Создать слайды из ответа"}
-                  </button>
-                  <p className="hint">
-                    ③ Картинки: кнопка «Картинки в ChatGPT» над слайдами откроет одно задание на всю серию. Скачайте
-                    картинки и перетащите их все разом на область слайдов — они разложатся по порядку.
-                  </p>
-                </>
-              ) : (
-                <>
-                  <label className="check">
-                    <input type="checkbox" checked={autoImages} onChange={(e) => setAutoImages(e.target.checked)} />
-                    Сразу сгенерировать изображения
-                  </label>
-                  <button className="btn btn--primary btn--wide" disabled={busyText} onClick={generateText}>
-                    {busyText ? "Пишу тексты…" : slides.length ? "Перегенерировать карусель" : "Сгенерировать карусель"}
-                  </button>
-                </>
-              )}
+                  {s.id === active?.id && (
+                    <div className="markup">
+                      {MARKUP.map((m) => (
+                        <button
+                          key={m.id}
+                          title={m.title}
+                          className={`mk mk--${m.id}`}
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={() => applyMarkup(s.id, m.apply)}
+                        >
+                          {m.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  <textarea
+                    ref={(el) => {
+                      if (el) areaRefs.current.set(s.id, el);
+                      else areaRefs.current.delete(s.id);
+                    }}
+                    className="tarea"
+                    rows={Math.min(12, Math.max(3, s.text.split("\n").length + 1))}
+                    placeholder={i === 0 ? "Заголовок обложки\nи подпись под ним" : "Заголовок слайда\n\nТекст под заголовком"}
+                    value={s.text}
+                    onFocus={() => select(s.id, false)}
+                    onChange={(e) => updateSlide(s.id, { text: e.target.value })}
+                  />
+
+                  <div className="tcard-photo">
+                    {s.image ? (
+                      <>
+                        <img src={s.image} alt="" />
+                        <label className="focus">
+                          кадр
+                          <input
+                            type="range"
+                            min={0}
+                            max={100}
+                            value={s.imageFocus ?? 30}
+                            onChange={(e) => updateSlide(s.id, { imageFocus: Number(e.target.value) })}
+                          />
+                        </label>
+                        <button className="link" onClick={() => updateSlide(s.id, { image: undefined })}>
+                          убрать фото
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <label className="link">
+                          + фото
+                          <input
+                            type="file"
+                            accept="image/*"
+                            hidden
+                            onChange={(e) => {
+                              const f = e.target.files?.[0];
+                              if (f) setImage(s.id, f);
+                              e.target.value = "";
+                            }}
+                          />
+                        </label>
+                        <button className="link" onClick={() => openChat(imagePromptFor(s), "Фото")}>
+                          фото в ChatGPT
+                        </button>
+                        {hasKey && (
+                          <button className="link" disabled={s.imageStatus === "loading"} onClick={() => generatePhoto(s.id)}>
+                            {s.imageStatus === "loading" ? "генерирую…" : "сгенерировать (API)"}
+                          </button>
+                        )}
+                      </>
+                    )}
+                  </div>
+                  {s.imageStatus === "error" && <p className="error">{s.imageError}</p>}
+                </div>
+              ))}
+              <button className="btn btn--wide" onClick={addSlide}>
+                + Добавить слайд
+              </button>
+              <details className="help">
+                <summary>Как оформлять текст</summary>
+                <ul>
+                  <li>Первый абзац — крупный заголовок, дальше — обычный текст. Абзацы разделяйте пустой строкой.</li>
+                  <li>
+                    <b>Акцент</b> (<code>**слова**</code>) — в заголовке цветом, в тексте жирным.
+                  </li>
+                  <li>
+                    <b>Заголовок</b> (<code># строка</code>) — крупная строка в любом месте слайда.
+                  </li>
+                  <li>
+                    <b>Линия</b> (<code>---</code>), <b>Цитата</b> (<code>&gt; строка</code>), <b>Плашка</b> (<code>! строка</code>,
+                    крупно — <code>! # строка</code>).
+                  </li>
+                  <li>Слайд с фото оформляется как обложка: крупный заголовок капсом, подпись справа.</li>
+                  <li>Фото можно перетащить прямо на карточку или на превью.</li>
+                </ul>
+              </details>
+            </div>
+          ) : (
+            <div className="form">
+              <textarea
+                className="bigtext"
+                value={bigText}
+                onChange={(e) => onBigText(e.target.value)}
+                placeholder={"Вставьте или напишите весь текст.\n\nСлайды разделяйте строкой\n===\n\nили разбейте кнопками ниже."}
+              />
               <p className="hint">
-                Совет: 7–10 слайдов, хук на первом, одна мысль на слайд, призыв к действию на последнем. В заголовках
-                **звёздочками** отмечаются акцентные слова.
+                Слайды разделяются строкой <code>===</code>. Текст без разделителей можно разбить автоматически:
               </p>
+              <button className="btn btn--wide" onClick={() => applySplit(paragraphsToSlides(bigText, slides))}>
+                Каждый абзац — отдельный слайд
+              </button>
+              <div className="row">
+                <button className="btn grow" onClick={() => applySplit(autoSplit(bigText, splitCount, slides))}>
+                  Разбить поровну на
+                </button>
+                <input
+                  className="num"
+                  type="number"
+                  min={2}
+                  max={MAX_SLIDES}
+                  value={splitCount}
+                  onChange={(e) => setSplitCount(Math.min(MAX_SLIDES, Math.max(2, Number(e.target.value) || 2)))}
+                />
+                <span className="muted">слайдов</span>
+              </div>
             </div>
           )}
 
-          {tab === "design" && (
+          <details className="ai">
+            <summary>✨ Написать текст с ChatGPT</summary>
+            <div className="form">
+              <input
+                placeholder="Тема: например, почему скроллинг — не отдых"
+                value={project.topic}
+                onChange={(e) => setProject((p) => ({ ...p, topic: e.target.value }))}
+              />
+              <div className="row">
+                <button
+                  className="btn btn--primary grow"
+                  onClick={() =>
+                    project.topic.trim()
+                      ? openChat(textTaskPrompt(project.topic, splitCount), "Текст")
+                      : setToast({ kind: "error", text: "Напишите тему" })
+                  }
+                >
+                  Открыть в ChatGPT
+                </button>
+                <button className="btn grow" onClick={pasteAnswer}>
+                  Вставить ответ
+                </button>
+              </div>
+              {hasKey && (
+                <button className="btn btn--wide" disabled={busy} onClick={generateWithApi}>
+                  {busy ? "Пишу…" : "Сгенерировать сразу (API-ключ)"}
+                </button>
+              )}
+              <p className="hint">
+                ChatGPT ответит в нужном формате — скопируйте ответ и нажмите «Вставить ответ». Слайдов: {splitCount}{" "}
+                (меняется в «Одним текстом»).
+              </p>
+            </div>
+          </details>
+          <details className="ai">
+            <summary>Подпись к посту и сброс</summary>
+            <div className="form">
+              <label>
+                Подпись к посту (попадёт в ZIP как caption.txt)
+                <textarea rows={4} value={project.caption} onChange={(e) => setProject((p) => ({ ...p, caption: e.target.value }))} />
+              </label>
+              <div className="row">
+                <button className="btn grow" onClick={loadSample}>
+                  Текст-пример
+                </button>
+                <button className="btn grow" onClick={clearAll}>
+                  Очистить всё
+                </button>
+              </div>
+            </div>
+          </details>
+        </aside>
+
+        {/* ================= Превью ================= */}
+        <main className="center">
+          <div className="stage" ref={stageRef}>
+            <button className="nav" disabled={activeIndex === 0} onClick={() => select(slides[activeIndex - 1].id)}>
+              ‹
+            </button>
+            {active && (
+              <div className="stage-slide" {...dropImage(active.id)}>
+                <ScaledSlide width={stageW}>
+                  <SlideView
+                    slide={active}
+                    index={activeIndex}
+                    total={slides.length}
+                    tone={toneOf(slides, activeIndex, design)}
+                    design={design}
+                    hints
+                  />
+                </ScaledSlide>
+              </div>
+            )}
+            <button className="nav" disabled={activeIndex >= slides.length - 1} onClick={() => select(slides[activeIndex + 1].id)}>
+              ›
+            </button>
+          </div>
+          <div className="stage-bar">
+            <span className="muted">
+              Слайд {activeIndex + 1} из {slides.length} · 1080×1350
+            </span>
+            <button className="btn btn--ghost" disabled={exporting} onClick={exportOne}>
+              Скачать этот слайд
+            </button>
+          </div>
+          <div className="strip">
+            {slides.map((s, i) => (
+              <div
+                key={s.id}
+                className={`thumb ${s.id === active?.id ? "thumb--active" : ""}`}
+                onClick={() => select(s.id)}
+                {...dropImage(s.id)}
+              >
+                <ScaledSlide width={84}>
+                  <SlideView
+                    ref={(el) => {
+                      if (el) thumbRefs.current.set(s.id, el);
+                      else thumbRefs.current.delete(s.id);
+                    }}
+                    slide={s}
+                    index={i}
+                    total={slides.length}
+                    tone={toneOf(slides, i, design)}
+                    design={design}
+                  />
+                </ScaledSlide>
+                <span>{i + 1}</span>
+              </div>
+            ))}
+            {slides.length < MAX_SLIDES && (
+              <button className="thumb thumb--add" onClick={addSlide} title="Добавить слайд">
+                +
+              </button>
+            )}
+          </div>
+        </main>
+
+        {/* ================= Стиль ================= */}
+        <aside className="panel panel--right">
+          <div className="tabs">
+            <button className={tab === "style" ? "active" : ""} onClick={() => setTab("style")}>
+              Стиль
+            </button>
+            <button className={tab === "colors" ? "active" : ""} onClick={() => setTab("colors")}>
+              Цвета и фото
+            </button>
+          </div>
+
+          {tab === "style" ? (
             <div className="form">
               <div className="field-title">Тема</div>
               <div className="themes">
                 {THEMES.map((t) => {
-                  const d = { ...design, ...t.design };
+                  const d = { ...design, ...t.design } as Design;
                   return (
                     <button
                       key={t.id}
                       className={`theme ${design.themeId === t.id ? "active" : ""}`}
-                      style={{ background: d.bg, color: d.text }}
                       onClick={() => setDesign({ ...t.design, themeId: t.id })}
                     >
-                      <span className="theme-aa" style={{ fontFamily: fontCss(d.headingFont) }}>
-                        Аа<i style={{ color: d.accent }}>.</i>
+                      <span className="theme-sws">
+                        <span className="theme-sw" style={{ background: `linear-gradient(160deg, ${d.light.bg1}, ${d.light.bg2})`, color: d.light.accent }}>
+                          <span style={{ fontFamily: `var(--f-${d.headingFont})` }}>Аа</span>
+                        </span>
+                        <span className="theme-sw" style={{ background: `linear-gradient(160deg, ${d.dark.bg1}, ${d.dark.bg2})`, color: d.dark.accent }}>
+                          <span style={{ fontFamily: `var(--f-${d.headingFont})` }}>Аа</span>
+                        </span>
                       </span>
-                      <span className="theme-name" style={{ fontFamily: fontCss(d.bodyFont) }}>
-                        {t.label}
-                      </span>
+                      <span className="theme-name">{t.label}</span>
                     </button>
                   );
                 })}
               </div>
 
-              <div className="field-title">Палитра</div>
-              <div className="palettes">
-                {PALETTES.map((p) => (
-                  <button
-                    key={p.id}
-                    title={p.label}
-                    className={`swatch ${design.paletteId === p.id ? "active" : ""}`}
-                    style={{ background: p.bg, color: p.text, borderColor: p.accent }}
-                    onClick={() => setDesign({ paletteId: p.id, ...pickPalette(p.id) })}
-                  >
-                    <span style={{ background: p.accent }} />
-                    Аа
-                  </button>
-                ))}
-              </div>
-              <div className="colors">
-                {(["bg", "text", "muted", "accent"] as const).map((k) => (
-                  <label key={k} className="color">
-                    <input type="color" value={design[k]} onChange={(e) => setDesign({ [k]: e.target.value })} />
-                    {{ bg: "Фон", text: "Текст", muted: "Второстеп.", accent: "Акцент" }[k]}
-                  </label>
-                ))}
-              </div>
-
-              <div className="row">
-                <label>
-                  Шрифт заголовков
-                  <select value={design.headingFont} onChange={(e) => setDesign({ headingFont: e.target.value })}>
-                    {FONTS.map((f) => (
-                      <option key={f.id} value={f.id}>
-                        {f.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-              <div className="row">
-                <label>
-                  Шрифт текста
-                  <select value={design.bodyFont} onChange={(e) => setDesign({ bodyFont: e.target.value })}>
-                    {FONTS.map((f) => (
-                      <option key={f.id} value={f.id}>
-                        {f.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-              <div className="row">
-                <label>
-                  Выделение слов
-                  <select
-                    value={design.highlight}
-                    onChange={(e) => setDesign({ highlight: e.target.value as Design["highlight"] })}
-                  >
-                    <option value="italic">Курсив + акцент</option>
-                    <option value="color">Цветом</option>
-                    <option value="marker">Маркером</option>
-                  </select>
-                </label>
-                <label>
-                  Выравнивание
-                  <select
-                    value={design.align}
-                    onChange={(e) => setDesign({ align: e.target.value as Design["align"] })}
-                  >
-                    <option value="left">Слева</option>
-                    <option value="center">По центру</option>
-                  </select>
-                </label>
-              </div>
+              <label>
+                Шрифт заголовков
+                <select value={design.headingFont} onChange={(e) => setDesign({ headingFont: e.target.value })}>
+                  {fontOptions}
+                </select>
+              </label>
+              <label>
+                Шрифт текста
+                <select value={design.bodyFont} onChange={(e) => setDesign({ bodyFont: e.target.value })}>
+                  {fontOptions}
+                </select>
+              </label>
+              <label>
+                Шрифт на фото
+                <select value={design.coverFont} onChange={(e) => setDesign({ coverFont: e.target.value })}>
+                  {fontOptions}
+                </select>
+              </label>
               <label>
                 Размер заголовков: {Math.round(design.titleScale * 100)}%
-                <input
-                  type="range"
-                  min={0.7}
-                  max={1.3}
-                  step={0.05}
-                  value={design.titleScale}
-                  onChange={(e) => setDesign({ titleScale: Number(e.target.value) })}
-                />
+                <input type="range" min={0.6} max={1.5} step={0.05} value={design.titleScale} onChange={(e) => setDesign({ titleScale: Number(e.target.value) })} />
               </label>
               <label>
-                Затемнение фото: {Math.round(design.overlay * 100)}%
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.05}
-                  value={design.overlay}
-                  onChange={(e) => setDesign({ overlay: Number(e.target.value) })}
-                />
+                Размер текста: {Math.round(design.bodyScale * 100)}%
+                <input type="range" min={0.7} max={1.4} step={0.05} value={design.bodyScale} onChange={(e) => setDesign({ bodyScale: Number(e.target.value) })} />
               </label>
-
-              <div className="field-title">Макеты</div>
-              {(
-                [
-                  ["coverLayout", "Обложка"],
-                  ["layout", "Слайды с контентом"],
-                  ["ctaLayout", "Финальный слайд"],
-                ] as const
-              ).map(([key, label]) => (
-                <label key={key}>
-                  {label}
-                  <select value={design[key]} onChange={(e) => setDesign({ [key]: e.target.value as LayoutId })}>
-                    {LAYOUTS.map((l) => (
-                      <option key={l.id} value={l.id}>
-                        {l.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              ))}
-
-              <div className="field-title">Стиль изображений</div>
-              <select value={design.imageStyleId} onChange={(e) => setDesign({ imageStyleId: e.target.value })}>
-                {IMAGE_STYLES.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.label}
-                  </option>
-                ))}
-              </select>
-              {design.imageStyleId === "custom" && (
-                <textarea
-                  rows={2}
-                  placeholder="На английском: e.g. dreamy pastel film photo, soft pink light"
-                  value={design.customImageStyle}
-                  onChange={(e) => setDesign({ customImageStyle: e.target.value })}
-                />
-              )}
-
-              <label className="check">
-                <input
-                  type="checkbox"
-                  checked={design.matchImageColors}
-                  onChange={(e) => setDesign({ matchImageColors: e.target.checked })}
-                />
-                Подгонять цвета картинок под палитру
-              </label>
+              <div className="seg2">
+                <button className={design.align === "left" ? "active" : ""} onClick={() => setDesign({ align: "left" })}>
+                  Слева
+                </button>
+                <button className={design.align === "center" ? "active" : ""} onClick={() => setDesign({ align: "center" })}>
+                  По центру
+                </button>
+              </div>
 
               <div className="field-title">Элементы</div>
               <label>
@@ -721,349 +770,103 @@ export default function App() {
                 <input value={design.handle} onChange={(e) => setDesign({ handle: e.target.value })} />
               </label>
               <label className="check">
-                <input
-                  type="checkbox"
-                  checked={design.showCounter}
-                  onChange={(e) => setDesign({ showCounter: e.target.checked })}
-                />
-                Номер слайда
+                <input type="checkbox" checked={design.showCounter} onChange={(e) => setDesign({ showCounter: e.target.checked })} />
+                Номер «02 / 11»
               </label>
               <label className="check">
-                <input
-                  type="checkbox"
-                  checked={design.showSwipe}
-                  onChange={(e) => setDesign({ showSwipe: e.target.checked })}
-                />
-                Подсказка «листай» / «сохрани»
+                <input type="checkbox" checked={design.showArrow} onChange={(e) => setDesign({ showArrow: e.target.checked })} />
+                Стрелка «листай»
               </label>
               <label className="check">
-                <input
-                  type="checkbox"
-                  checked={design.uppercaseTitles}
-                  onChange={(e) => setDesign({ uppercaseTitles: e.target.checked })}
-                />
-                Заголовки капсом
+                <input type="checkbox" checked={design.alternate} onChange={(e) => setDesign({ alternate: e.target.checked })} />
+                Чередовать светлый и тёмный фон
               </label>
-            </div>
-          )}
-
-          {tab === "caption" && (
-            <div className="form">
-              <label>
-                Подпись к посту
-                <textarea
-                  rows={12}
-                  value={project.caption}
-                  onChange={(e) => setProject((p) => ({ ...p, caption: e.target.value }))}
-                />
-              </label>
-              <label>
-                Хэштеги
-                <textarea
-                  rows={3}
-                  value={project.hashtags.map((h) => `#${h}`).join(" ")}
-                  onChange={(e) =>
-                    setProject((p) => ({
-                      ...p,
-                      hashtags: e.target.value
-                        .split(/[\s,]+/)
-                        .map((h) => h.replace(/^#/, ""))
-                        .filter(Boolean),
-                    }))
-                  }
-                />
-              </label>
-              <button
-                className="btn btn--wide"
-                onClick={() =>
-                  copy(`${project.caption}\n\n${project.hashtags.map((h) => `#${h}`).join(" ")}`, "Текст")
-                }
-              >
-                Скопировать подпись
-              </button>
-              <p className="hint">Первые ~125 символов видны до «ещё» — там должен быть крючок.</p>
-            </div>
-          )}
-        </aside>
-
-        {/* ---------- Слайды ---------- */}
-        <main
-          className={`canvas ${dragOver ? "canvas--drop" : ""}`}
-          onDragOver={(e) => {
-            if (!slides.length || !e.dataTransfer.types.includes("Files")) return;
-            e.preventDefault();
-            setDragOver(true);
-          }}
-          onDragLeave={(e) => {
-            if (e.currentTarget === e.target) setDragOver(false);
-          }}
-          onDrop={(e) => {
-            setDragOver(false);
-            if (!slides.length) return;
-            e.preventDefault();
-            bulkUpload(Array.from(e.dataTransfer.files));
-          }}
-        >
-          {slides.length === 0 ? (
-            <div className="empty">
-              <h1>Карусели для Instagram за минуту</h1>
-              <p>
-                Опишите тему слева — ChatGPT напишет цепляющие тексты по правилам вирусных каруселей и нарисует
-                изображения в едином стиле. Можно работать через обычный ChatGPT по подписке (без ключа) или
-                автоматически через API-ключ. Дальше правьте текст, шрифты, цвета и скачивайте готовые PNG 1080×1350.
-              </p>
-              <ol>
-                <li>Хук на первом слайде — до 8 слов</li>
-                <li>Одна мысль на слайд, 7–10 слайдов</li>
-                <li>Формат 4:5 (1080×1350) — занимает больше места в ленте</li>
-                <li>Последний слайд — призыв сохранить, поделиться или написать в директ</li>
-              </ol>
+              <div className="seg2">
+                <button className={design.startTone === "light" ? "active" : ""} onClick={() => setDesign({ startTone: "light" })}>
+                  Начать со светлого
+                </button>
+                <button className={design.startTone === "dark" ? "active" : ""} onClick={() => setDesign({ startTone: "dark" })}>
+                  С тёмного
+                </button>
+              </div>
             </div>
           ) : (
-            <>
-              <div className="canvas-bar">
-                <span>
-                  {slides.length} слайдов · 1080×1350
-                </span>
-                <div className="canvas-actions">
-                  {settings.mode === "chatgpt" ? (
-                    <>
-                      <button className="btn btn--primary" onClick={openImagesInChatGPT}>
-                        Картинки в ChatGPT{missingImages.length > 0 ? ` (${missingImages.length})` : ""}
-                      </button>
-                      <label className="btn">
-                        Загрузить картинки
-                        <input
-                          type="file"
-                          accept="image/*"
-                          multiple
-                          hidden
-                          onChange={(e) => {
-                            bulkUpload(Array.from(e.target.files ?? []));
-                            e.target.value = "";
-                          }}
-                        />
+            <div className="form">
+              {(["light", "dark"] as const).map((tone) => (
+                <div key={tone}>
+                  <div className="field-title">{tone === "light" ? "Светлые слайды" : "Тёмные слайды"}</div>
+                  <div className="colors">
+                    {(
+                      [
+                        ["bg1", "Фон"],
+                        ["bg2", "Фон 2"],
+                        ["text", "Текст"],
+                        ["muted", "Мягкий"],
+                        ["accent", "Акцент"],
+                      ] as const
+                    ).map(([k, label]) => (
+                      <label key={k} className="color">
+                        <input type="color" value={design[tone][k]} onChange={(e) => setPalette(tone, { [k]: e.target.value })} />
+                        {label}
                       </label>
-                    </>
-                  ) : (
-                    missingImages.length > 0 && (
-                      <button className="btn" onClick={() => generateImages(missingImages.map((s) => s.id))}>
-                        Сгенерировать недостающие изображения ({missingImages.length})
-                      </button>
-                    )
-                  )}
-                  <button className="btn" onClick={addSlide}>
-                    + Слайд
-                  </button>
-                </div>
-              </div>
-              <div className="grid">
-                {slides.map((s, i) => (
-                  <div
-                    key={s.id}
-                    className={`card ${s.id === selectedId ? "card--active" : ""}`}
-                    onClick={() => setSelectedId(s.id)}
-                    onDragOver={(e) => e.preventDefault()}
-                    onDrop={(e) => {
-                      const f = Array.from(e.dataTransfer.files).find((x) => x.type.startsWith("image/"));
-                      if (!f) return;
-                      e.preventDefault();
-                      e.stopPropagation();
-                      uploadImage(s.id, f);
-                      setSelectedId(s.id);
-                      setDragOver(false);
-                    }}
-                  >
-                    <ScaledSlide width={300}>
-                      <SlideView
-                        ref={(el) => {
-                          if (el) slideRefs.current.set(s.id, el);
-                          else slideRefs.current.delete(s.id);
-                        }}
-                        slide={s}
-                        index={i}
-                        total={slides.length}
-                        design={design}
-                      />
-                    </ScaledSlide>
-                    {s.imageStatus === "loading" && <div className="card-spinner" />}
-                    {s.imageStatus === "error" && <div className="card-error" title={s.imageError}>!</div>}
-                    <div className="card-foot">
-                      <span>
-                        {i + 1}. {{ cover: "Обложка", content: "Контент", cta: "Призыв" }[s.kind]}
-                      </span>
-                      <span className="card-tools">
-                        <button title="Влево" onClick={(e) => (e.stopPropagation(), moveSlide(s.id, -1))}>
-                          ←
-                        </button>
-                        <button title="Вправо" onClick={(e) => (e.stopPropagation(), moveSlide(s.id, 1))}>
-                          →
-                        </button>
-                        <button title="Скачать PNG" onClick={(e) => (e.stopPropagation(), exportOne(s.id))}>
-                          ⤓
-                        </button>
-                      </span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </>
-          )}
-        </main>
-
-        {/* ---------- Редактор слайда ---------- */}
-        <aside className="panel panel--right">
-          {!selected ? (
-            <p className="hint">Выберите слайд, чтобы отредактировать текст и изображение.</p>
-          ) : (
-            <div className="form">
-              <div className="field-title">
-                Слайд {selectedIndex + 1} из {slides.length}
-              </div>
-              <div className="row">
-                <label>
-                  Тип
-                  <select
-                    value={selected.kind}
-                    onChange={(e) => updateSlide(selected.id, { kind: e.target.value as SlideKind })}
-                  >
-                    <option value="cover">Обложка</option>
-                    <option value="content">Контент</option>
-                    <option value="cta">Призыв</option>
-                  </select>
-                </label>
-                <label>
-                  Макет
-                  <select
-                    value={selected.layout ?? ""}
-                    onChange={(e) =>
-                      updateSlide(selected.id, { layout: (e.target.value || undefined) as LayoutId | undefined })
-                    }
-                  >
-                    <option value="">Как в дизайне</option>
-                    {LAYOUTS.map((l) => (
-                      <option key={l.id} value={l.id}>
-                        {l.label}
-                      </option>
                     ))}
-                  </select>
-                </label>
-              </div>
-              <label>
-                Надпись над заголовком
-                <input value={selected.eyebrow} onChange={(e) => updateSlide(selected.id, { eyebrow: e.target.value })} />
+                  </div>
+                </div>
+              ))}
+
+              <div className="field-title">Слайды с фото</div>
+              <label className="check">
+                <input type="checkbox" checked={design.coverUppercase} onChange={(e) => setDesign({ coverUppercase: e.target.checked })} />
+                Заголовок капсом
+              </label>
+              <label className="check">
+                <input type="checkbox" checked={design.haze} onChange={(e) => setDesign({ haze: e.target.checked })} />
+                Светлая дымка
               </label>
               <label>
-                Заголовок <span className="muted">(**акцент**)</span>
+                Затемнение под текстом: {Math.round(design.overlay * 100)}%
+                <input type="range" min={0} max={1} step={0.05} value={design.overlay} onChange={(e) => setDesign({ overlay: Number(e.target.value) })} />
+              </label>
+              <label>
+                Стиль фото для ChatGPT
+                <select value={design.imageStyleId} onChange={(e) => setDesign({ imageStyleId: e.target.value })}>
+                  {IMAGE_STYLES.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {design.imageStyleId === "custom" && (
                 <textarea
-                  rows={3}
-                  value={selected.title}
-                  onChange={(e) => updateSlide(selected.id, { title: e.target.value })}
+                  rows={2}
+                  placeholder="Например: soft beige portrait photo, natural window light"
+                  value={design.customImageStyle}
+                  onChange={(e) => setDesign({ customImageStyle: e.target.value })}
+                />
+              )}
+              <label className="btn">
+                Загрузить несколько фото по порядку
+                <input
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  hidden
+                  onChange={(e) => {
+                    const files = sortImageFiles(Array.from(e.target.files ?? []));
+                    const targets = slides.filter((s) => !s.image);
+                    files.slice(0, targets.length).forEach((f, i) => setImage(targets[i].id, f));
+                    setToast({ kind: "info", text: `Фото добавлено на слайды без фото: ${Math.min(files.length, targets.length)}.` });
+                    e.target.value = "";
+                  }}
                 />
               </label>
               <button
-                className="btn btn--ghost"
-                disabled={variants?.slideId === selected.id && variants.loading}
-                onClick={() => suggestTitles(selected)}
+                className="btn"
+                onClick={() => openChat(imagesTaskPrompt(slides.filter((s) => !s.image).slice(0, 10).map(imagePromptFor)), "Серия фото")}
               >
-                {variants?.slideId === selected.id && variants.loading
-                  ? "Придумываю…"
-                  : selected.kind === "cover"
-                    ? "✨ 5 вариантов хука"
-                    : "✨ 5 вариантов заголовка"}
+                Серия фото в ChatGPT (для слайдов без фото)
               </button>
-              {variants?.slideId === selected.id && variants.titles.length > 0 && (
-                <div className="variants">
-                  {variants.titles.map((t) => (
-                    <button key={t} onClick={() => updateSlide(selected.id, { title: t })}>
-                      {t.replace(/\*\*/g, "")}
-                    </button>
-                  ))}
-                </div>
-              )}
-              <label>
-                Текст
-                <textarea
-                  rows={5}
-                  value={selected.body}
-                  onChange={(e) => updateSlide(selected.id, { body: e.target.value })}
-                />
-              </label>
-
-              <div className="field-title">Изображение</div>
-              <label>
-                Сцена (промпт, лучше на английском)
-                <textarea
-                  rows={4}
-                  value={selected.imagePrompt}
-                  onChange={(e) => updateSlide(selected.id, { imagePrompt: e.target.value })}
-                />
-              </label>
-              <div className="btn-row">
-                {settings.mode === "chatgpt" ? (
-                  <button className="btn btn--primary" onClick={() => openChat(fullPrompt(selected, design), "Картинка")}>
-                    Открыть в ChatGPT
-                  </button>
-                ) : (
-                <button
-                  className="btn btn--primary"
-                  disabled={selected.imageStatus === "loading"}
-                  onClick={() => generateImage(selected.id)}
-                >
-                  {selected.imageStatus === "loading"
-                    ? "Генерирую…"
-                    : selected.image
-                      ? "Перегенерировать"
-                      : "Сгенерировать"}
-                </button>
-                )}
-                <label className="btn">
-                  Загрузить
-                  <input
-                    type="file"
-                    accept="image/*"
-                    hidden
-                    onChange={(e) => {
-                      const f = e.target.files?.[0];
-                      if (f) uploadImage(selected.id, f);
-                      e.target.value = "";
-                    }}
-                  />
-                </label>
-              </div>
-              <div className="btn-row">
-                <button className="btn btn--ghost" onClick={() => copy(fullPrompt(selected, design), "Промпт")}>
-                  Копировать промпт для ChatGPT
-                </button>
-                {selected.image && (
-                  <button className="btn btn--ghost" onClick={() => updateSlide(selected.id, { image: undefined, imageStatus: "idle" })}>
-                    Убрать
-                  </button>
-                )}
-              </div>
-              {selected.imageStatus === "error" && <p className="error">{selected.imageError}</p>}
-              {selected.image && (
-                <label>
-                  Кадрирование по вертикали
-                  <input
-                    type="range"
-                    min={0}
-                    max={100}
-                    value={selected.imageFocus ?? 50}
-                    onChange={(e) => updateSlide(selected.id, { imageFocus: Number(e.target.value) })}
-                  />
-                </label>
-              )}
-
-              <div className="field-title">Слайд</div>
-              <div className="btn-row">
-                <button className="btn" onClick={() => duplicateSlide(selected.id)}>
-                  Дублировать
-                </button>
-                <button className="btn btn--danger" onClick={() => removeSlide(selected.id)}>
-                  Удалить
-                </button>
-              </div>
             </div>
           )}
         </aside>
@@ -1072,59 +875,31 @@ export default function App() {
       {showSettings && (
         <div className="modal-bg" onClick={() => setShowSettings(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>Настройки OpenAI</h3>
+            <h3>Автоматическая генерация (необязательно)</h3>
             <div className="form">
-              <label>
-                API-ключ
-                <input
-                  type="password"
-                  placeholder="sk-…"
-                  value={settings.apiKey}
-                  onChange={(e) => updateSettings({ apiKey: e.target.value })}
-                />
-              </label>
               <p className="hint">
-                Ключ хранится только в этом браузере и отправляется напрямую в OpenAI. Создать ключ:{" "}
+                Без ключа всё работает вручную и через обычный ChatGPT. С API-ключом OpenAI текст и фото генерируются прямо
+                здесь (API оплачивается отдельно от подписки). Ключ хранится только в этом браузере.{" "}
                 <a href="https://platform.openai.com/api-keys" target="_blank" rel="noreferrer">
-                  platform.openai.com/api-keys
+                  Получить ключ
                 </a>
               </p>
               <label>
-                Модель для текста
-                <input
-                  list="text-models"
-                  value={settings.textModel}
-                  onChange={(e) => updateSettings({ textModel: e.target.value })}
-                />
-                <datalist id="text-models">
-                  <option value="gpt-5.5" />
-                  <option value="gpt-5.4" />
-                  <option value="gpt-5.4-mini" />
-                  <option value="gpt-5-mini" />
-                  <option value="gpt-4.1" />
-                </datalist>
+                API-ключ
+                <input type="password" placeholder="sk-…" value={settings.apiKey} onChange={(e) => updateSettings({ apiKey: e.target.value })} />
               </label>
               <label>
-                Модель для изображений
-                <input
-                  list="image-models"
-                  value={settings.imageModel}
-                  onChange={(e) => updateSettings({ imageModel: e.target.value })}
-                />
-                <datalist id="image-models">
-                  <option value="gpt-image-2" />
-                  <option value="gpt-image-1.5" />
-                  <option value="gpt-image-1" />
-                  <option value="gpt-image-1-mini" />
-                </datalist>
+                Модель текста
+                <input value={settings.textModel} onChange={(e) => updateSettings({ textModel: e.target.value })} />
+              </label>
+              <label>
+                Модель изображений
+                <input value={settings.imageModel} onChange={(e) => updateSettings({ imageModel: e.target.value })} />
               </label>
               <label>
                 Качество изображений
-                <select
-                  value={settings.imageQuality}
-                  onChange={(e) => updateSettings({ imageQuality: e.target.value as Settings["imageQuality"] })}
-                >
-                  <option value="low">Низкое — быстро и дёшево (черновик)</option>
+                <select value={settings.imageQuality} onChange={(e) => updateSettings({ imageQuality: e.target.value as Settings["imageQuality"] })}>
+                  <option value="low">Низкое — быстро</option>
                   <option value="medium">Среднее</option>
                   <option value="high">Высокое</option>
                 </select>
@@ -1137,9 +912,7 @@ export default function App() {
         </div>
       )}
 
-      {showPreview && (
-        <InstagramPreview project={project} onClose={() => setShowPreview(false)} />
-      )}
+      {showPreview && <InstagramPreview project={project} onClose={() => setShowPreview(false)} />}
 
       {toast && (
         <div className={`toast toast--${toast.kind}`} onClick={() => setToast(null)}>

@@ -1,4 +1,4 @@
-import type { LayoutId } from "./types";
+type LayoutId = "overlay" | "split" | "frame" | "minimal";
 
 const COMPOSITION: Record<LayoutId, string> = {
   overlay:
